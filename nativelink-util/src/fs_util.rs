@@ -130,6 +130,43 @@ pub async fn hardlink_directory_tree(src_dir: &Path, dst_dir: &Path) -> Result<C
     Ok(CloneMethod::Hardlink)
 }
 
+/// Per-file hardlink materialization, exposed so benchmarks can compare the
+/// legacy code path against the clonefile fast path on the same host. This is
+/// exactly the branch [`hardlink_directory_tree`] takes on Linux / Windows
+/// and the fallback it takes on macOS when `clonefile(2)` fails. Not part of
+/// the public API surface — `#[doc(hidden)]`.
+#[doc(hidden)]
+pub async fn hardlink_directory_tree_perfile(
+    src_dir: &Path,
+    dst_dir: &Path,
+) -> Result<(), Error> {
+    error_if!(
+        !src_dir.exists(),
+        "Source directory does not exist: {}",
+        src_dir.display()
+    );
+    error_if!(
+        dst_dir.exists(),
+        "Destination directory already exists: {}",
+        dst_dir.display()
+    );
+    if let Some(parent) = dst_dir.parent() {
+        fs::create_dir_all(parent).await.err_tip(|| {
+            format!(
+                "Failed to create parent of destination: {}",
+                parent.display()
+            )
+        })?;
+    }
+    fs::create_dir_all(dst_dir).await.err_tip(|| {
+        format!(
+            "Failed to create destination directory: {}",
+            dst_dir.display()
+        )
+    })?;
+    hardlink_directory_tree_recursive(src_dir, dst_dir).await
+}
+
 /// Recursively clones a directory tree using APFS `clonefile(2)`. On success
 /// the destination shares data blocks with the source via copy-on-write; the
 /// operation is O(1) in tree size regardless of file count.
@@ -582,6 +619,95 @@ mod tests {
         let dst_content = fs::read_to_string(&dst_file).await?;
         assert_eq!(dst_content, "mutated by clone");
 
+        Ok(())
+    }
+
+    /// Symlinks *inside* the cloned tree must survive as symlinks — clonefile's
+    /// `CLONE_NOFOLLOW` flag only applies to the top-level src path, not to
+    /// descendant symlinks. If clonefile silently materialized the link's
+    /// target file, an action's input tree could read data that escaped the
+    /// cached directory (e.g., a malicious symlink in CAS data could point
+    /// at `/etc/passwd`). Verify the link is preserved verbatim and resolves
+    /// to the same relative target.
+    #[cfg(target_os = "macos")]
+    #[nativelink_test("crate")]
+    async fn test_clonefile_preserves_internal_symlinks() -> Result<(), Error> {
+        let (temp_dir, src_dir) = create_test_directory().await?;
+
+        // Add a relative symlink inside the src tree pointing at a sibling file.
+        let link_path = src_dir.join("link_to_file1.txt");
+        fs::symlink("file1.txt", &link_path).await?;
+
+        let dst_dir = temp_dir.path().join("clone_dst");
+        let method = hardlink_directory_tree(&src_dir, &dst_dir).await?;
+        assert_eq!(method, CloneMethod::Clonefile);
+
+        let dst_link = dst_dir.join("link_to_file1.txt");
+        let dst_link_meta = fs::symlink_metadata(&dst_link).await?;
+        assert!(
+            dst_link_meta.file_type().is_symlink(),
+            "internal symlink must remain a symlink after clonefile, not be \
+             materialized as the target file (would escape the cache directory)"
+        );
+        let dst_target = fs::read_link(&dst_link).await?;
+        assert_eq!(
+            dst_target.as_os_str(),
+            std::ffi::OsStr::new("file1.txt"),
+            "symlink target must be preserved verbatim"
+        );
+
+        Ok(())
+    }
+
+    /// The clonefile path materializes the *top-level* source path. If
+    /// `src_dir` is itself a symlink, `CLONE_NOFOLLOW` ensures we clone the
+    /// link, not its target. The destination should therefore end up as a
+    /// symlink and `hardlink_directory_tree` should NOT silently follow the
+    /// link and clone whatever it points at. This guards against the worker
+    /// being tricked into materializing arbitrary filesystem locations.
+    #[cfg(target_os = "macos")]
+    #[nativelink_test("crate")]
+    async fn test_clonefile_nofollow_on_top_level_symlink_src() -> Result<(), Error> {
+        let (temp_dir, src_dir) = create_test_directory().await?;
+        let symlink_src = temp_dir.path().join("symlink_to_src");
+        fs::symlink(&src_dir, &symlink_src).await?;
+
+        let dst_dir = temp_dir.path().join("clone_dst");
+        let _ = hardlink_directory_tree(&symlink_src, &dst_dir).await?;
+
+        // CLONE_NOFOLLOW + clonefile of a symlink should yield a symlink at
+        // the destination (not the resolved directory contents).
+        let dst_meta = fs::symlink_metadata(&dst_dir).await?;
+        assert!(
+            dst_meta.file_type().is_symlink(),
+            "top-level symlink src must be cloned as a symlink, not followed"
+        );
+
+        Ok(())
+    }
+
+    /// Negative case: hardlink path must reject a dst whose parent doesn't
+    /// exist when we can't create it (e.g., parent path crosses a file).
+    /// Confirms the error path doesn't silently produce a half-materialized
+    /// tree on macOS clonefile fall-through either.
+    #[nativelink_test("crate")]
+    async fn test_dst_under_file_parent_errors_cleanly() -> Result<(), Error> {
+        let temp_dir = TempDir::new()?;
+        let src = temp_dir.path().join("src");
+        fs::create_dir(&src).await?;
+        fs::write(src.join("a.txt"), b"a").await?;
+
+        // Use a regular file as a "parent" — creating dst inside it must fail.
+        let blocker = temp_dir.path().join("not_a_dir");
+        fs::write(&blocker, b"").await?;
+        let dst = blocker.join("dst");
+
+        let result = hardlink_directory_tree(&src, &dst).await;
+        assert!(result.is_err(), "must fail when dst's parent is a file");
+        assert!(
+            !dst.exists(),
+            "no half-materialized dst tree should remain on error"
+        );
         Ok(())
     }
 
