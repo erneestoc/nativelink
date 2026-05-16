@@ -858,8 +858,10 @@ impl<T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorker<T,
                         }
                         (sleep_fn_pin)(Duration::from_secs_f32(sleep_duration)).await;
                     }
-                    error!(ERROR_MSG);
-                    return Err(err.append(ERROR_MSG));
+                    // Don't terminate the worker process — fall through to
+                    // kill_all + reconnect. The stuck create_and_add_action
+                    // futures will be cancelled when kill_all drops them.
+                    warn!(ERROR_MSG);
                 }
                 error!(?err, "Worker disconnected from scheduler");
                 // Kill off any existing actions because if we re-connect, we'll
