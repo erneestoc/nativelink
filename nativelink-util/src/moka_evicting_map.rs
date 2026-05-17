@@ -114,13 +114,8 @@ const EVICTION_CHANNEL_DEPTH: usize = 4096;
 /// * `I` — anchor instant wrapper (defaults to `SystemTime`).
 /// * `C` — item-callback type (defaults to `ItemCallbackHolder = NoopRemove`).
 #[derive(MetricsComponent)]
-pub struct MokaEvictingMap<
-    K,
-    Q,
-    T,
-    I = std::time::SystemTime,
-    C = ItemCallbackHolder,
-> where
+pub struct MokaEvictingMap<K, Q, T, I = std::time::SystemTime, C = ItemCallbackHolder>
+where
     K: Hash + Eq + Ord + Clone + Debug + Send + Sync + Borrow<Q> + 'static,
     Q: Hash + Eq + Ord + Debug,
     T: LenEntry + Clone + Debug + Send + Sync + 'static,

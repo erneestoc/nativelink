@@ -177,7 +177,10 @@ async fn insert_evicts_oldest_under_max_bytes() -> Result<(), Error> {
     flush(&map);
     // We expect the cache to keep at most ~ ((3-1)/1)=2 KB-weighted entries.
     let len = map.len_for_test();
-    assert!(len <= 4, "expected eviction under byte budget, got len={len}");
+    assert!(
+        len <= 4,
+        "expected eviction under byte budget, got len={len}"
+    );
     assert!(len >= 1, "expected at least the last insert to survive");
     Ok(())
 }
@@ -256,11 +259,16 @@ async fn insert_with_time_preserves_startup_order() -> Result<(), Error> {
 async fn insert_many_batches_pending_tasks() -> Result<(), Error> {
     let map: MokaEvictingMap<u64, u64, BytesWrapper, MockInstantWrapped> =
         MokaEvictingMap::with_anchor(&policy_max_count(1000), MockInstantWrapped::default());
-    let pairs: Vec<_> = (0u64..50).map(|i| (i, Bytes::from(vec![0u8; 1]).into())).collect();
+    let pairs: Vec<_> = (0u64..50)
+        .map(|i| (i, Bytes::from(vec![0u8; 1]).into()))
+        .collect();
     let replaced = map.insert_many(pairs);
     assert!(replaced.is_empty(), "no prior entries should be replaced");
     let len = map.len_for_test();
-    assert_eq!(len, 50, "all 50 entries should be present after insert_many");
+    assert_eq!(
+        len, 50,
+        "all 50 entries should be present after insert_many"
+    );
     Ok(())
 }
 
@@ -290,8 +298,7 @@ async fn remove_if_with_arc_ptr_eq_semantics() -> Result<(), Error> {
     // Wrong-pointer cond should leave the entry alone.
     let other = Arc::new(UnrefCounting::new(1));
     map.insert(100u64, Arc::clone(&other));
-    let not_removed =
-        map.remove_if(&100u64, |held| Arc::<UnrefCounting>::ptr_eq(held, &entry));
+    let not_removed = map.remove_if(&100u64, |held| Arc::<UnrefCounting>::ptr_eq(held, &entry));
     assert!(!not_removed, "ptr_eq against unrelated Arc must not remove");
     assert!(map.get(&100u64).is_some());
     Ok(())
@@ -321,11 +328,12 @@ async fn range_walks_btree_in_order() -> Result<(), Error> {
 // 10. add_item_callback fires on eviction via the async drainer.
 #[nativelink_test]
 async fn add_item_callback_fires_on_eviction() -> Result<(), Error> {
-    let map: Arc<MokaEvictingMap<u64, u64, Arc<UnrefCounting>, MockInstantWrapped, CallbackCounter>> =
-        Arc::new(MokaEvictingMap::with_anchor(
-            &policy_max_count(2),
-            MockInstantWrapped::default(),
-        ));
+    let map: Arc<
+        MokaEvictingMap<u64, u64, Arc<UnrefCounting>, MockInstantWrapped, CallbackCounter>,
+    > = Arc::new(MokaEvictingMap::with_anchor(
+        &policy_max_count(2),
+        MockInstantWrapped::default(),
+    ));
     map.start_background_eviction();
     let cb = CallbackCounter::new();
     let cb_invocations = Arc::clone(&cb.invocations);
@@ -356,11 +364,9 @@ async fn add_item_callback_fires_on_eviction() -> Result<(), Error> {
 //     trigger inline_fallback_count > 0.
 #[nativelink_test]
 async fn unref_bridge_handles_full_channel_inline() -> Result<(), Error> {
-    let map: Arc<MokaEvictingMap<u64, u64, Arc<UnrefCounting>, MockInstantWrapped>> =
-        Arc::new(MokaEvictingMap::with_anchor(
-            &policy_max_count(1),
-            MockInstantWrapped::default(),
-        ));
+    let map: Arc<MokaEvictingMap<u64, u64, Arc<UnrefCounting>, MockInstantWrapped>> = Arc::new(
+        MokaEvictingMap::with_anchor(&policy_max_count(1), MockInstantWrapped::default()),
+    );
     // Intentionally do NOT call start_background_eviction().
     // Each insert beyond 1 evicts the prior one — pushing onto the channel.
     // After EVICTION_CHANNEL_DEPTH (4096) events, the next eviction must
@@ -387,11 +393,9 @@ async fn unref_bridge_handles_full_channel_inline() -> Result<(), Error> {
 // 12. Concurrent reads are lock-free / make progress.
 #[nativelink_test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_reads_are_lock_free() -> Result<(), Error> {
-    let map: Arc<MokaEvictingMap<u64, u64, BytesWrapper, MockInstantWrapped>> =
-        Arc::new(MokaEvictingMap::with_anchor(
-            &policy_max_count(10_000),
-            MockInstantWrapped::default(),
-        ));
+    let map: Arc<MokaEvictingMap<u64, u64, BytesWrapper, MockInstantWrapped>> = Arc::new(
+        MokaEvictingMap::with_anchor(&policy_max_count(10_000), MockInstantWrapped::default()),
+    );
     for i in 0u64..1000 {
         map.insert(i, Bytes::from(vec![0u8; 1]).into());
     }
@@ -421,11 +425,9 @@ async fn concurrent_reads_are_lock_free() -> Result<(), Error> {
 // 13. Concurrent writes progress under contention.
 #[nativelink_test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_writes_progress_under_contention() -> Result<(), Error> {
-    let map: Arc<MokaEvictingMap<u64, u64, BytesWrapper, MockInstantWrapped>> =
-        Arc::new(MokaEvictingMap::with_anchor(
-            &policy_max_count(10_000),
-            MockInstantWrapped::default(),
-        ));
+    let map: Arc<MokaEvictingMap<u64, u64, BytesWrapper, MockInstantWrapped>> = Arc::new(
+        MokaEvictingMap::with_anchor(&policy_max_count(10_000), MockInstantWrapped::default()),
+    );
     let mut handles = Vec::new();
     for t in 0..8u64 {
         let m = Arc::clone(&map);
@@ -441,7 +443,10 @@ async fn concurrent_writes_progress_under_contention() -> Result<(), Error> {
     }
     flush(&map);
     let len = map.len_for_test();
-    assert!(len >= 1000, "writers produced fewer than 1000 live entries: {len}");
+    assert!(
+        len >= 1000,
+        "writers produced fewer than 1000 live entries: {len}"
+    );
     Ok(())
 }
 
@@ -515,18 +520,19 @@ async fn weigher_handles_large_values_via_kb_scaling() -> Result<(), Error> {
     map.insert(1u64, big.into());
     flush(&map);
     let got = map.get(&1u64);
-    assert!(got.is_some(), "64 MiB value should be admitted under 256 MiB cap");
+    assert!(
+        got.is_some(),
+        "64 MiB value should be admitted under 256 MiB cap"
+    );
     Ok(())
 }
 
 // 18. cancel-safe unref: drop the map mid-eviction, no leaks (just no panic).
 #[nativelink_test]
 async fn cancel_safe_unref_drains_on_drop() -> Result<(), Error> {
-    let map: Arc<MokaEvictingMap<u64, u64, Arc<UnrefCounting>, MockInstantWrapped>> =
-        Arc::new(MokaEvictingMap::with_anchor(
-            &policy_max_count(5),
-            MockInstantWrapped::default(),
-        ));
+    let map: Arc<MokaEvictingMap<u64, u64, Arc<UnrefCounting>, MockInstantWrapped>> = Arc::new(
+        MokaEvictingMap::with_anchor(&policy_max_count(5), MockInstantWrapped::default()),
+    );
     map.start_background_eviction();
     let unref_counter = Arc::new(AtomicU64::new(0));
     let notify = Arc::new(Notify::new());
