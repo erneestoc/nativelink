@@ -122,4 +122,5 @@ path = "benches/evicting_map_comparison.rs"
 
 [package.metadata.cargo-machete]
 # Used by nativelink_test macro
-ignored = ["tracing-test"]
+# dashmap: reserved for Phase 2 pinning surface (see moka_evicting_map.rs §"Phase 1 scope")
+ignored = ["tracing-test", "dashmap"]

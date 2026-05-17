@@ -28,6 +28,7 @@ pub mod instant_wrapper;
 pub mod known_platform_property_provider;
 pub mod metrics;
 pub mod metrics_utils;
+pub mod moka_evicting_map;
 pub mod operation_state_manager;
 pub mod origin_event;
 pub mod origin_event_publisher;
