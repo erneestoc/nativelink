@@ -1,0 +1,125 @@
+warning: /Users/ernesto/workspace/nativelink/.claude/worktrees/agent-a3c1c0df574655161/Cargo.toml: unused manifest key: workspace.cargo-features-manager
+   Compiling nativelink-util v1.2.0 (/Users/ernesto/workspace/nativelink/.claude/worktrees/agent-a3c1c0df574655161/nativelink-util)
+    Finished `bench` profile [optimized] target(s) in 21.60s
+     Running benches/evicting_map_comparison.rs (target/release/deps/evicting_map_comparison-339e7dc9f8be8c8a)
+Benchmarking read_heavy_uniform/evicting_map/uniform
+Benchmarking read_heavy_uniform/evicting_map/uniform: Warming up for 1.0000 s
+Benchmarking read_heavy_uniform/evicting_map/uniform: Collecting 10 samples in estimated 3.0619 s (825 iterations)
+Benchmarking read_heavy_uniform/evicting_map/uniform: Analyzing
+read_heavy_uniform/evicting_map/uniform
+                        time:   [3.6775 ms 3.6906 ms 3.7006 ms]
+                        thrpt:  [8.6472 Melem/s 8.6707 Melem/s 8.7017 Melem/s]
+Benchmarking read_heavy_uniform/moka_evicting_map/uniform
+Benchmarking read_heavy_uniform/moka_evicting_map/uniform: Warming up for 1.0000 s
+Benchmarking read_heavy_uniform/moka_evicting_map/uniform: Collecting 10 samples in estimated 3.2409 s (660 iterations)
+Benchmarking read_heavy_uniform/moka_evicting_map/uniform: Analyzing
+read_heavy_uniform/moka_evicting_map/uniform
+                        time:   [4.8251 ms 4.8790 ms 4.9198 ms]
+                        thrpt:  [6.5044 Melem/s 6.5587 Melem/s 6.6320 Melem/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low severe
+
+Benchmarking read_heavy_zipfian/evicting_map/zipfian
+Benchmarking read_heavy_zipfian/evicting_map/zipfian: Warming up for 1.0000 s
+Benchmarking read_heavy_zipfian/evicting_map/zipfian: Collecting 10 samples in estimated 3.1492 s (880 iterations)
+Benchmarking read_heavy_zipfian/evicting_map/zipfian: Analyzing
+read_heavy_zipfian/evicting_map/zipfian
+                        time:   [3.4002 ms 3.4633 ms 3.5314 ms]
+                        thrpt:  [9.0617 Melem/s 9.2396 Melem/s 9.4111 Melem/s]
+Found 3 outliers among 10 measurements (30.00%)
+  2 (20.00%) low severe
+  1 (10.00%) high severe
+Benchmarking read_heavy_zipfian/moka_evicting_map/zipfian
+Benchmarking read_heavy_zipfian/moka_evicting_map/zipfian: Warming up for 1.0000 s
+Benchmarking read_heavy_zipfian/moka_evicting_map/zipfian: Collecting 10 samples in estimated 3.1755 s (660 iterations)
+Benchmarking read_heavy_zipfian/moka_evicting_map/zipfian: Analyzing
+read_heavy_zipfian/moka_evicting_map/zipfian
+                        time:   [4.7586 ms 4.7903 ms 4.8314 ms]
+                        thrpt:  [6.6234 Melem/s 6.6801 Melem/s 6.7247 Melem/s]
+
+Benchmarking write_heavy_unique_keys/evicting_map/unique_keys
+Benchmarking write_heavy_unique_keys/evicting_map/unique_keys: Warming up for 1.0000 s
+Benchmarking write_heavy_unique_keys/evicting_map/unique_keys: Collecting 10 samples in estimated 3.0337 s (275 iterations)
+Benchmarking write_heavy_unique_keys/evicting_map/unique_keys: Analyzing
+write_heavy_unique_keys/evicting_map/unique_keys
+                        time:   [11.148 ms 11.180 ms 11.207 ms]
+                        thrpt:  [713.83 Kelem/s 715.58 Kelem/s 717.59 Kelem/s]
+Benchmarking write_heavy_unique_keys/moka_evicting_map/unique_keys
+Benchmarking write_heavy_unique_keys/moka_evicting_map/unique_keys: Warming up for 1.0000 s
+Benchmarking write_heavy_unique_keys/moka_evicting_map/unique_keys: Collecting 10 samples in estimated 3.4505 s (110 iterations)
+Benchmarking write_heavy_unique_keys/moka_evicting_map/unique_keys: Analyzing
+write_heavy_unique_keys/moka_evicting_map/unique_keys
+                        time:   [31.037 ms 31.315 ms 31.488 ms]
+                        thrpt:  [254.07 Kelem/s 255.47 Kelem/s 257.75 Kelem/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+
+Benchmarking mixed_80r_20w/evicting_map/80r_20w
+Benchmarking mixed_80r_20w/evicting_map/80r_20w: Warming up for 1.0000 s
+Benchmarking mixed_80r_20w/evicting_map/80r_20w: Collecting 10 samples in estimated 3.0876 s (220 iterations)
+Benchmarking mixed_80r_20w/evicting_map/80r_20w: Analyzing
+mixed_80r_20w/evicting_map/80r_20w
+                        time:   [14.044 ms 14.111 ms 14.227 ms]
+                        thrpt:  [2.2492 Melem/s 2.2677 Melem/s 2.2786 Melem/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low mild
+Benchmarking mixed_80r_20w/moka_evicting_map/80r_20w
+Benchmarking mixed_80r_20w/moka_evicting_map/80r_20w: Warming up for 1.0000 s
+Benchmarking mixed_80r_20w/moka_evicting_map/80r_20w: Collecting 10 samples in estimated 3.3175 s (110 iterations)
+Benchmarking mixed_80r_20w/moka_evicting_map/80r_20w: Analyzing
+mixed_80r_20w/moka_evicting_map/80r_20w
+                        time:   [29.509 ms 29.768 ms 30.157 ms]
+                        thrpt:  [1.0611 Melem/s 1.0750 Melem/s 1.0844 Melem/s]
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) low mild
+  1 (10.00%) high severe
+
+Benchmarking concurrent_writes_same_key/evicting_map/10keys
+Benchmarking concurrent_writes_same_key/evicting_map/10keys: Warming up for 1.0000 s
+Benchmarking concurrent_writes_same_key/evicting_map/10keys: Collecting 10 samples in estimated 3.6349 s (275 iterations)
+Benchmarking concurrent_writes_same_key/evicting_map/10keys: Analyzing
+concurrent_writes_same_key/evicting_map/10keys
+                        time:   [13.137 ms 13.169 ms 13.221 ms]
+                        thrpt:  [605.08 Kelem/s 607.50 Kelem/s 608.95 Kelem/s]
+Benchmarking concurrent_writes_same_key/moka_evicting_map/10keys
+Benchmarking concurrent_writes_same_key/moka_evicting_map/10keys: Warming up for 1.0000 s
+Benchmarking concurrent_writes_same_key/moka_evicting_map/10keys: Collecting 10 samples in estimated 4.0797 s (165 iterations)
+Benchmarking concurrent_writes_same_key/moka_evicting_map/10keys: Analyzing
+concurrent_writes_same_key/moka_evicting_map/10keys
+                        time:   [24.189 ms 24.391 ms 24.715 ms]
+                        thrpt:  [323.69 Kelem/s 327.99 Kelem/s 330.73 Kelem/s]
+
+Benchmarking eviction_pressure_filesystem_shape/evicting_map/tight
+Benchmarking eviction_pressure_filesystem_shape/evicting_map/tight: Warming up for 1.0000 s
+Benchmarking eviction_pressure_filesystem_shape/evicting_map/tight: Collecting 10 samples in estimated 3.4115 s (385 iterations)
+Benchmarking eviction_pressure_filesystem_shape/evicting_map/tight: Analyzing
+eviction_pressure_filesystem_shape/evicting_map/tight
+                        time:   [8.9082 ms 8.9328 ms 8.9532 ms]
+                        thrpt:  [893.53 Kelem/s 895.58 Kelem/s 898.05 Kelem/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low mild
+Benchmarking eviction_pressure_filesystem_shape/moka_evicting_map/tight
+Benchmarking eviction_pressure_filesystem_shape/moka_evicting_map/tight: Warming up for 1.0000 s
+Benchmarking eviction_pressure_filesystem_shape/moka_evicting_map/tight: Collecting 10 samples in estimated 4.4885 s (165 iterations)
+Benchmarking eviction_pressure_filesystem_shape/moka_evicting_map/tight: Analyzing
+eviction_pressure_filesystem_shape/moka_evicting_map/tight
+                        time:   [26.933 ms 27.119 ms 27.298 ms]
+                        thrpt:  [293.07 Kelem/s 294.99 Kelem/s 297.03 Kelem/s]
+
+Benchmarking startup_insertion_atime_ordered/evicting_map/startup
+Benchmarking startup_insertion_atime_ordered/evicting_map/startup: Warming up for 1.0000 s
+Benchmarking startup_insertion_atime_ordered/evicting_map/startup: Collecting 10 samples in estimated 3.6133 s (275 iterations)
+Benchmarking startup_insertion_atime_ordered/evicting_map/startup: Analyzing
+startup_insertion_atime_ordered/evicting_map/startup
+                        time:   [12.645 ms 12.844 ms 13.108 ms]
+                        thrpt:  [762.88 Kelem/s 778.55 Kelem/s 790.83 Kelem/s]
+Benchmarking startup_insertion_atime_ordered/moka_evicting_map/startup
+Benchmarking startup_insertion_atime_ordered/moka_evicting_map/startup: Warming up for 1.0000 s
+Benchmarking startup_insertion_atime_ordered/moka_evicting_map/startup: Collecting 10 samples in estimated 3.7037 s (220 iterations)
+Benchmarking startup_insertion_atime_ordered/moka_evicting_map/startup: Analyzing
+startup_insertion_atime_ordered/moka_evicting_map/startup
+                        time:   [16.575 ms 16.753 ms 17.136 ms]
+                        thrpt:  [583.58 Kelem/s 596.91 Kelem/s 603.33 Kelem/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+
