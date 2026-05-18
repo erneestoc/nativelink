@@ -253,6 +253,74 @@ mod tests {
         Ok(())
     }
 
+    /// Regression test for the EPERM-on-shell-scripts bug.
+    ///
+    /// Some build rules (`rules_cc`, `rules_rust`, `rules_swift`) mark
+    /// shell-script toolchain wrappers (e.g. `cc_wrapper.sh`,
+    /// `lto_linker_wrapper.sh`) as `is_executable = false` in the REAPI
+    /// `FileNode`, even though the action needs to exec them. The previous
+    /// code defaulted to `0o444` (read-only, no execute) for such files,
+    /// causing EPERM/EACCES at exec time. The fix defaults the materialized
+    /// mode to `0o555` so the file is read+execute (no write — hermeticity
+    /// preserved).
+    #[cfg(target_family = "unix")]
+    #[nativelink_test]
+    async fn download_to_directory_non_executable_shell_script_gets_0o555()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const SHELL_SCRIPT_NAME: &str = "cc_wrapper.sh";
+        const SHELL_SCRIPT_CONTENT: &str = "#!/bin/sh\nexec \"$@\"\n";
+
+        let (fast_store, slow_store, cas_store, _ac_store) = setup_stores().await?;
+
+        let root_directory_digest = {
+            let script_digest = DigestInfo::new([7u8; 32], SHELL_SCRIPT_CONTENT.len() as u64);
+            slow_store
+                .as_ref()
+                .update_oneshot(script_digest, SHELL_SCRIPT_CONTENT.into())
+                .await?;
+
+            let root_directory_digest = DigestInfo::new([8u8; 32], 32);
+            let root_directory = Directory {
+                files: vec![FileNode {
+                    name: SHELL_SCRIPT_NAME.to_string(),
+                    digest: Some(script_digest.into()),
+                    // Reproduce the upstream bug condition: rules_cc/rules_rust
+                    // set is_executable=false on shell-script wrappers.
+                    is_executable: false,
+                    // No NodeProperties → no explicit unix_mode; the
+                    // materializer must pick a safe default.
+                    node_properties: None,
+                }],
+                ..Default::default()
+            };
+            slow_store
+                .as_ref()
+                .update_oneshot(root_directory_digest, root_directory.encode_to_vec().into())
+                .await?;
+            root_directory_digest
+        };
+
+        let download_dir = make_temp_path("download_dir_shell_script");
+        fs::create_dir_all(&download_dir).await?;
+        download_to_directory(
+            cas_store.as_ref(),
+            fast_store.as_pin(),
+            &root_directory_digest,
+            &download_dir,
+        )
+        .await?;
+
+        let script_path = format!("{download_dir}/{SHELL_SCRIPT_NAME}");
+        let metadata = fs::metadata(&script_path).await?;
+        let mode = metadata.mode() & 0o777;
+        assert_eq!(
+            mode, 0o555,
+            "Non-executable shell script must default to 0o555 (read+execute) to \
+             avoid EPERM when toolchain wrappers exec it; got 0o{mode:o}"
+        );
+        Ok(())
+    }
+
     #[nativelink_test]
     async fn download_to_directory_folder_download_test() -> Result<(), Box<dyn core::error::Error>>
     {

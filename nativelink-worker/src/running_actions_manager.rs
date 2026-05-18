@@ -146,7 +146,17 @@ pub fn download_to_directory<'a>(
             };
             #[cfg_attr(target_family = "windows", allow(unused_assignments))]
             if file.is_executable {
-                unix_mode = Some(unix_mode.unwrap_or(0o444) | 0o111);
+                unix_mode = Some(unix_mode.unwrap_or(0o555) | 0o111);
+            }
+            // Default to 0o555 (read+execute, no write) to match CAS store
+            // defaults. Some build tools (`rules_cc`, `rules_rust`,
+            // `rules_swift`) set `is_executable=false` on shell scripts that
+            // must be executable (cc_wrapper.sh, lto_linker_wrapper.sh,
+            // toolchain wrappers); using 0o555 as the base avoids the EPERM
+            // class entirely while preserving hermeticity (no write bit).
+            #[cfg_attr(target_family = "windows", allow(unused_assignments))]
+            if unix_mode.is_none() {
+                unix_mode = Some(0o555);
             }
             futures.push(
                 cas_store
