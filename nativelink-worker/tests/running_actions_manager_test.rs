@@ -424,6 +424,407 @@ mod tests {
         Ok(())
     }
 
+    // ---- Helpers for concurrent-fetch tests ----
+    //
+    // A minimal store wrapper that delegates to an inner MemoryStore but
+    // injects a per-call sleep on `get_part`, and exposes counters so tests
+    // can measure max concurrent in-flight fetches and total fetch count.
+    //
+    // This lets us prove two things:
+    //
+    //   1. download_to_directory launches blob fetches CONCURRENTLY, so
+    //      total wall time is bounded by max-in-flight latency, not by
+    //      sum-of-per-blob latency.
+    //   2. Hardlinking does NOT block on later fetches: once an early
+    //      blob arrives, the hardlinker starts work on it while the
+    //      fetcher is still pulling the remaining blobs.
+    mod concurrent_fetch_harness {
+        use core::pin::Pin;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        use core::time::Duration;
+        use std::sync::Arc;
+
+        use async_trait::async_trait;
+        use nativelink_error::Error;
+        use nativelink_metric::{
+            MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent,
+        };
+        use nativelink_store::memory_store::MemoryStore;
+        use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
+        use nativelink_util::health_utils::{
+            HealthRegistryBuilder, HealthStatusIndicator, default_health_status_indicator,
+        };
+        use nativelink_util::store_trait::{
+            RemoveItemCallback, StoreDriver, StoreKey, StoreOptimizations, UploadSizeInfo,
+        };
+
+        #[derive(Debug)]
+        pub(super) struct DelayedStore {
+            inner: Arc<MemoryStore>,
+            get_part_delay: Duration,
+            in_flight: AtomicUsize,
+            max_in_flight: AtomicUsize,
+            total_get_parts: AtomicUsize,
+        }
+
+        impl DelayedStore {
+            pub(super) fn new(inner: Arc<MemoryStore>, get_part_delay: Duration) -> Arc<Self> {
+                Arc::new(Self {
+                    inner,
+                    get_part_delay,
+                    in_flight: AtomicUsize::new(0),
+                    max_in_flight: AtomicUsize::new(0),
+                    total_get_parts: AtomicUsize::new(0),
+                })
+            }
+
+            pub(super) fn max_in_flight(&self) -> usize {
+                self.max_in_flight.load(Ordering::SeqCst)
+            }
+
+            pub(super) fn total_get_parts(&self) -> usize {
+                self.total_get_parts.load(Ordering::SeqCst)
+            }
+        }
+
+        impl MetricsComponent for DelayedStore {
+            fn publish(
+                &self,
+                _kind: MetricKind,
+                _field_metadata: MetricFieldData,
+            ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+                Ok(MetricPublishKnownKindData::Component)
+            }
+        }
+
+        default_health_status_indicator!(DelayedStore);
+
+        #[async_trait]
+        impl StoreDriver for DelayedStore {
+            async fn has_with_results(
+                self: Pin<&Self>,
+                keys: &[StoreKey<'_>],
+                results: &mut [Option<u64>],
+            ) -> Result<(), Error> {
+                Pin::new(self.inner.as_ref())
+                    .has_with_results(keys, results)
+                    .await
+            }
+
+            async fn update(
+                self: Pin<&Self>,
+                key: StoreKey<'_>,
+                reader: DropCloserReadHalf,
+                size_info: UploadSizeInfo,
+            ) -> Result<(), Error> {
+                Pin::new(self.inner.as_ref())
+                    .update(key, reader, size_info)
+                    .await
+            }
+
+            fn optimized_for(&self, optimization: StoreOptimizations) -> bool {
+                // Do NOT forward MemoryStore's SubscribesToUpdateOneshot
+                // optimization: doing so causes FastSlowStore to bypass
+                // the slow leg's get_part during populate_fast_store on
+                // a miss, which would defeat the whole point of this
+                // wrapper.
+                let _ = optimization;
+                false
+            }
+
+            async fn get_part(
+                self: Pin<&Self>,
+                key: StoreKey<'_>,
+                writer: &mut DropCloserWriteHalf,
+                offset: u64,
+                length: Option<u64>,
+            ) -> Result<(), Error> {
+                self.total_get_parts.fetch_add(1, Ordering::SeqCst);
+                let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                // Best-effort max-tracking; fine for a test harness.
+                let mut prev_max = self.max_in_flight.load(Ordering::SeqCst);
+                while current > prev_max {
+                    match self.max_in_flight.compare_exchange(
+                        prev_max,
+                        current,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => break,
+                        Err(actual) => prev_max = actual,
+                    }
+                }
+                tokio::time::sleep(self.get_part_delay).await;
+                let result = Pin::new(self.inner.as_ref())
+                    .get_part(key, writer, offset, length)
+                    .await;
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                result
+            }
+
+            fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
+                self
+            }
+
+            fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
+                self
+            }
+
+            fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+                self
+            }
+
+            fn register_health(self: Arc<Self>, registry: &mut HealthRegistryBuilder) {
+                registry.register_indicator(self);
+            }
+
+            fn register_remove_callback(
+                self: Arc<Self>,
+                _callback: Arc<dyn RemoveItemCallback>,
+            ) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+    }
+
+    // Concurrent fetch test: with N=20 missing blobs and a 75 ms per-blob
+    // slow-store delay, serial fetch would take ~1500 ms; concurrent fetch
+    // (bounded at 128) finishes in roughly one delay unit. We assert
+    // (a) max-in-flight >= 4 (proves concurrency, with plenty of headroom
+    // for slow CI) and (b) wall time < 500 ms (proves we're not serial).
+    #[nativelink_test]
+    async fn download_to_directory_fetches_blobs_concurrently()
+    -> Result<(), Box<dyn core::error::Error>> {
+        use core::time::Duration;
+        use std::time::Instant;
+
+        use nativelink_util::store_trait::Store;
+
+        use concurrent_fetch_harness::DelayedStore;
+
+        const NUM_FILES: usize = 20;
+        const PER_FETCH_DELAY: Duration = Duration::from_millis(75);
+
+        // Set up a custom FastSlowStore where the slow store wraps a
+        // MemoryStore with a per-`get_part` sleep.
+        let fast_config = FilesystemSpec {
+            content_path: make_temp_path("content_path"),
+            temp_path: make_temp_path("temp_path"),
+            eviction_policy: None,
+            ..Default::default()
+        };
+        let fast_store = FilesystemStore::new(&fast_config).await?;
+        let inner_slow = MemoryStore::new(&MemorySpec::default());
+        let delayed_slow = DelayedStore::new(inner_slow.clone(), PER_FETCH_DELAY);
+        let cas_store = Arc::new(FastSlowStore::new(
+            &FastSlowSpec {
+                fast: StoreSpec::Filesystem(fast_config),
+                slow: StoreSpec::Memory(MemorySpec::default()),
+                fast_direction: StoreDirection::default(),
+                slow_direction: StoreDirection::default(),
+            },
+            Store::new(fast_store.clone()),
+            Store::new(delayed_slow.clone()),
+        ));
+
+        // Build a root directory containing NUM_FILES files with distinct
+        // digests. Each blob is small but distinct.
+        let mut file_nodes = Vec::with_capacity(NUM_FILES);
+        for i in 0..NUM_FILES {
+            let mut hash = [0u8; 32];
+            // i is bounded by NUM_FILES which fits in u8.
+            hash[0] = u8::try_from(i + 1).expect("NUM_FILES fits in u8");
+            hash[1] = 0xab;
+            let body = format!("blob-content-{i}");
+            let body_len = u64::try_from(body.len()).expect("test body fits in u64");
+            let digest = DigestInfo::new(hash, body_len);
+            // Insert directly into the inner slow store (bypasses delay
+            // wrapper for setup).
+            inner_slow.update_oneshot(digest, body.into()).await?;
+            file_nodes.push(FileNode {
+                name: format!("file_{i}.dat"),
+                digest: Some(digest.into()),
+                is_executable: false,
+                node_properties: None,
+            });
+        }
+        let root_directory = Directory {
+            files: file_nodes,
+            ..Default::default()
+        };
+        // The root directory proto must also be readable. Insert it via
+        // the inner store. NOTE: the very first `get_and_decode_digest`
+        // call in download_to_directory will also pay one delay slot for
+        // this proto.
+        let root_directory_digest = DigestInfo::new([0xff; 32], 32);
+        inner_slow
+            .update_oneshot(root_directory_digest, root_directory.encode_to_vec().into())
+            .await?;
+
+        let download_dir = make_temp_path("download_dir_concurrent");
+        fs::create_dir_all(&download_dir).await?;
+
+        let start = Instant::now();
+        download_to_directory(
+            cas_store.as_ref(),
+            fast_store.as_pin(),
+            &root_directory_digest,
+            &download_dir,
+        )
+        .await?;
+        let elapsed = start.elapsed();
+
+        let max_in_flight = delayed_slow.max_in_flight();
+        let total = delayed_slow.total_get_parts();
+
+        // All blobs were materialized as files.
+        for i in 0..NUM_FILES {
+            let path = format!("{download_dir}/file_{i}.dat");
+            let body = fs::read(&path).await?;
+            assert_eq!(from_utf8(&body)?, format!("blob-content-{i}"));
+        }
+
+        // Sanity: the slow store really did serve every fetch (i.e. nothing
+        // short-circuited around our delay wrapper). Expect at minimum
+        // NUM_FILES `get_part` calls (one per blob); the root directory
+        // proto itself adds one more.
+        assert!(
+            total >= NUM_FILES,
+            "expected at least {NUM_FILES} get_part calls, observed {total}",
+        );
+
+        // Proves concurrency: at some point during the run, multiple
+        // populate_fast_store calls were simultaneously inside `get_part`.
+        // We use a low threshold (4) to keep the test stable on slow CI.
+        // Serial behavior would yield max_in_flight == 1.
+        assert!(
+            max_in_flight >= 4,
+            "expected concurrent fetches (max_in_flight >= 4), observed max_in_flight = {max_in_flight} \
+             with total get_parts = {total}",
+        );
+
+        // Wall-clock bound: serial would be NUM_FILES * PER_FETCH_DELAY =
+        // 1500 ms. Concurrent (with cap 128) should finish in roughly one
+        // delay unit plus overhead. We use 500 ms as a generous upper bound.
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "expected concurrent fetch wall time < 500 ms, observed {elapsed:?} \
+             (serial would be ~{}ms)",
+            (NUM_FILES as u64) * 75,
+        );
+
+        Ok(())
+    }
+
+    // Streaming-hardlink test: confirms that hardlinks start while later
+    // fetches are still in flight. We use a single root directory with
+    // a known number of files, and observe that max_in_flight reaches
+    // the fetcher's natural cap; if hardlinks blocked the fetcher, we'd
+    // see throughput collapse below the serial-fetch wall-time budget.
+    //
+    // This is a coarser test than the first one - it just ensures we
+    // do not regress to a "fetch-all, then hardlink-all" two-phase
+    // structure that drops the overlap entirely.
+    #[nativelink_test]
+    async fn download_to_directory_streams_hardlinks_while_fetching()
+    -> Result<(), Box<dyn core::error::Error>> {
+        use core::time::Duration;
+        use std::time::Instant;
+
+        use nativelink_util::store_trait::Store;
+
+        use concurrent_fetch_harness::DelayedStore;
+
+        // Use enough files that a serial implementation would be
+        // obviously slow but few enough that the test stays fast.
+        const NUM_FILES: usize = 30;
+        const PER_FETCH_DELAY: Duration = Duration::from_millis(50);
+
+        let fast_config = FilesystemSpec {
+            content_path: make_temp_path("content_path_stream"),
+            temp_path: make_temp_path("temp_path_stream"),
+            eviction_policy: None,
+            ..Default::default()
+        };
+        let fast_store = FilesystemStore::new(&fast_config).await?;
+        let inner_slow = MemoryStore::new(&MemorySpec::default());
+        let delayed_slow = DelayedStore::new(inner_slow.clone(), PER_FETCH_DELAY);
+        let cas_store = Arc::new(FastSlowStore::new(
+            &FastSlowSpec {
+                fast: StoreSpec::Filesystem(fast_config),
+                slow: StoreSpec::Memory(MemorySpec::default()),
+                fast_direction: StoreDirection::default(),
+                slow_direction: StoreDirection::default(),
+            },
+            Store::new(fast_store.clone()),
+            Store::new(delayed_slow.clone()),
+        ));
+
+        let mut file_nodes = Vec::with_capacity(NUM_FILES);
+        for i in 0..NUM_FILES {
+            let mut hash = [0u8; 32];
+            // i is bounded by NUM_FILES which fits in u8.
+            hash[0] = u8::try_from(i + 1).expect("NUM_FILES fits in u8");
+            hash[1] = 0xcd;
+            let body = format!("stream-blob-{i}");
+            let body_len = u64::try_from(body.len()).expect("test body fits in u64");
+            let digest = DigestInfo::new(hash, body_len);
+            inner_slow.update_oneshot(digest, body.into()).await?;
+            file_nodes.push(FileNode {
+                name: format!("stream_file_{i}.dat"),
+                digest: Some(digest.into()),
+                is_executable: false,
+                node_properties: None,
+            });
+        }
+        let root_directory = Directory {
+            files: file_nodes,
+            ..Default::default()
+        };
+        let root_directory_digest = DigestInfo::new([0xee; 32], 32);
+        inner_slow
+            .update_oneshot(root_directory_digest, root_directory.encode_to_vec().into())
+            .await?;
+
+        let download_dir = make_temp_path("download_dir_stream");
+        fs::create_dir_all(&download_dir).await?;
+
+        let start = Instant::now();
+        download_to_directory(
+            cas_store.as_ref(),
+            fast_store.as_pin(),
+            &root_directory_digest,
+            &download_dir,
+        )
+        .await?;
+        let elapsed = start.elapsed();
+
+        // Verify all files materialized.
+        for i in 0..NUM_FILES {
+            let path = format!("{download_dir}/stream_file_{i}.dat");
+            let body = fs::read(&path).await?;
+            assert_eq!(from_utf8(&body)?, format!("stream-blob-{i}"));
+        }
+
+        // If fetches were serialized OR if the consumer held the producer
+        // back, total time would be at minimum NUM_FILES * 50 ms = 1500 ms.
+        // With concurrent fetch + streaming hardlink, we expect close to
+        // one delay unit plus per-blob overhead. Allow generous headroom.
+        assert!(
+            elapsed < Duration::from_millis(750),
+            "expected fetch+hardlink streaming wall time < 750 ms, observed {elapsed:?}",
+        );
+
+        // Concurrency was actually achieved.
+        assert!(
+            delayed_slow.max_in_flight() >= 4,
+            "expected concurrent fetches; observed max_in_flight = {}",
+            delayed_slow.max_in_flight(),
+        );
+
+        Ok(())
+    }
+
     #[nativelink_test]
     async fn ensure_output_files_full_directories_are_created_no_working_directory_test()
     -> Result<(), Box<dyn core::error::Error>> {

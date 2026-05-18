@@ -75,7 +75,7 @@ use scopeguard::{ScopeGuard, guard};
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::process;
-use tokio::sync::{Notify, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_stream::wrappers::ReadDirStream;
 use tonic::Request;
@@ -111,19 +111,56 @@ struct SideChannelInfo {
     failure: Option<SideChannelFailureReason>,
 }
 
-/// Maximum number of file-materialization (hardlink) or subdirectory
-/// recursion futures polled concurrently per directory level. Higher values
-/// drown APFS's per-volume metadata lock with `hardlink(2)` syscalls and
-/// regress overall throughput vs lower-contention concurrency.
+/// Maximum number of concurrent `populate_fast_store` (blob-fetch) calls in flight
+/// at one directory level.
 ///
-/// 64 is well above the inflection point on any modern Linux filesystem,
-/// so this is also a no-op on Linux beyond replacing tokio scheduling
-/// overhead.
-const DOWNLOAD_TO_DIRECTORY_CONCURRENCY: usize = 64;
+/// Higher than `DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY` because fetch is
+/// network-bound (low marginal cost per extra in-flight request) while hardlink
+/// is metadata-bound (contends on APFS's per-volume lock on macOS).
+const DOWNLOAD_TO_DIRECTORY_FETCH_CONCURRENCY: usize = 128;
 
-/// Aggressively download the digests of files and make a local folder from it. This function
-/// gates each directory level to at most `DOWNLOAD_TO_DIRECTORY_CONCURRENCY`
-/// concurrent in-flight materialization futures.
+/// Maximum number of concurrent `hardlink(2)` (plus `chmod`/`set_mtime`)
+/// futures in flight at one directory level.
+///
+/// 64 is well above the inflection point on Linux filesystems but below the
+/// point at which APFS metadata contention on macOS dominates throughput.
+/// Composes with `DOWNLOAD_TO_DIRECTORY_FETCH_CONCURRENCY`: fetch and
+/// hardlink phases overlap, each with its own bound.
+const DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY: usize = 64;
+
+/// Per-file work item materialized by `download_to_directory`. Collected up
+/// front so the fetcher (concurrent blob fetch) and hardlinker (concurrent
+/// `hardlink(2)`+chmod+mtime) phases can be driven from the same index.
+///
+/// `mtime` is split into `(seconds, nanos)` rather than carrying a
+/// `prost_types::Timestamp` to avoid leaking a proto-types dependency into
+/// this struct.
+struct FileToMaterialize {
+    digest: DigestInfo,
+    dest: String,
+    mtime: Option<(i64, i32)>,
+    #[cfg(target_family = "unix")]
+    unix_mode: Option<u32>,
+}
+
+/// Aggressively download the digests of files and make a local folder from it.
+///
+/// Two-phase pipeline:
+///
+/// 1. Fetcher: launches up to `DOWNLOAD_TO_DIRECTORY_FETCH_CONCURRENCY`
+///    `populate_fast_store` calls in flight, deduplicated per unique digest
+///    so the same blob is never fetched twice. As each blob lands, every file
+///    that needs it is forwarded to the channel.
+///
+/// 2. Hardlinker: consumes the channel, performing up to
+///    `DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY` `hardlink(2)` /
+///    `set_permissions` / `set_mtime` ops in flight.
+///
+/// Hardlinking begins as soon as the first blob arrives - it does not wait
+/// for all fetches to complete. Subdirectories recurse concurrently; symlinks
+/// run concurrently. Both share a single outer `try_join3` with the
+/// fetcher+hardlinker pipeline.
+///
 /// We require the `FilesystemStore` to be the `fast` store of `FastSlowStore`. This is for
 /// efficiency reasons. We will request the `FastSlowStore` to populate the entry then we will
 /// assume the `FilesystemStore` has the file available immediately after and hardlink the file
@@ -141,101 +178,231 @@ pub fn download_to_directory<'a>(
         let directory = get_and_decode_digest::<ProtoDirectory>(cas_store, digest.into())
             .await
             .err_tip(|| "Converting digest to Directory")?;
-        let mut futures = Vec::new();
 
+        // ---- Collect files ----
+        // We collect into a Vec first so we can (a) dedupe digests for the
+        // fetcher and (b) drive the producer/consumer pipeline.
+        let mut files_to_materialize: Vec<FileToMaterialize> =
+            Vec::with_capacity(directory.files.len());
         for file in directory.files {
-            let digest: DigestInfo = file
+            let file_digest: DigestInfo = file
                 .digest
                 .err_tip(|| "Expected Digest to exist in Directory::file::digest")?
                 .try_into()
                 .err_tip(|| "In Directory::file::digest")?;
             let dest = format!("{}/{}", current_directory, file.name);
             let (mtime, mut unix_mode) = match file.node_properties {
-                Some(properties) => (properties.mtime, properties.unix_mode),
+                Some(properties) => (
+                    properties.mtime.map(|t| (t.seconds, t.nanos)),
+                    properties.unix_mode,
+                ),
                 None => (None, None),
             };
             #[cfg_attr(target_family = "windows", allow(unused_assignments))]
             if file.is_executable {
                 unix_mode = Some(unix_mode.unwrap_or(0o444) | 0o111);
             }
-            futures.push(
-                cas_store
-                    .populate_fast_store(digest.into())
-                    .and_then(move |()| async move {
-                        if is_zero_digest(digest) {
-                            let mut file_slot = fs::create_file(&dest).await?;
-                            file_slot.write_all(&[]).await?;
-                        }
-                        else {
-                            let file_entry = filesystem_store
-                                .get_file_entry_for_digest(&digest)
-                                .await
-                                .err_tip(|| "During hard link")?;
-                            // TODO: add a test for #2051: deadlock with large number of files
-                            let src_path = file_entry.get_file_path_locked(|src| async move { Ok(PathBuf::from(src)) }).await?;
-                            fs::hard_link(&src_path, &dest)
-                                .await
-                                .map_err(|e| {
-                                    if e.code == Code::NotFound {
-                                        e.append(
-                                            format!(
-                                            "Could not make hardlink to {dest}, file was likely evicted from cache.\n\
-                                            This error often occurs when the filesystem store's max_bytes is too small for your workload.\n\
-                                            To fix this issue:\n\
-                                            1. Increase the 'max_bytes' value in your filesystem store configuration\n\
-                                            2. Example: Change 'max_bytes: 10000000000' to 'max_bytes: 50000000000' (or higher)\n\
-                                            3. The setting is typically found in your nativelink.json config under:\n\
-                                            stores -> [your_filesystem_store] -> filesystem -> eviction_policy -> max_bytes\n\
-                                            4. Restart NativeLink after making the change\n\n\
-                                            If this error persists after increasing max_bytes several times, please report at:\n\
-                                            https://github.com/TraceMachina/nativelink/issues\n\
-                                            Include your config file and both server and client logs to help us assist you."
-                                        ))
-                                    } else {
-                                        e.append(format!("Could not make hardlink to {dest}"))
-                                    }
-                                })?;
-                            }
-                        #[cfg(target_family = "unix")]
-                        if let Some(unix_mode) = unix_mode {
-                            fs::set_permissions(&dest, Permissions::from_mode(unix_mode))
-                                .await
-                                .err_tip(|| {
-                                    format!(
-                                        "Could not set unix mode in download_to_directory {dest}"
-                                    )
-                                })?;
-                        }
-                        if let Some(mtime) = mtime {
-                            spawn_blocking!("download_to_directory_set_mtime", move || {
-                                set_file_mtime(
-                                    &dest,
-                                    FileTime::from_unix_time(mtime.seconds, mtime.nanos as u32),
-                                )
-                                .err_tip(|| {
-                                    format!("Failed to set mtime in download_to_directory {dest}")
-                                })
-                            })
-                            .await
-                            .err_tip(
-                                || "Failed to launch spawn_blocking in download_to_directory",
-                            )??;
-                        }
-                        Ok(())
-                    })
-                    .map_err(move |e| e.append(format!("for digest {digest}")))
-                    .boxed(),
-            );
+            files_to_materialize.push(FileToMaterialize {
+                digest: file_digest,
+                dest,
+                mtime,
+                #[cfg(target_family = "unix")]
+                unix_mode,
+            });
         }
 
-        for directory in directory.directories {
-            let digest: DigestInfo = directory
+        // ---- Build dedup index: digest -> indices of files that need it ----
+        // The fetcher drains `unique_digests`; once a digest is fetched, every
+        // file in `digest_to_file_indices[&digest]` is forwarded to the
+        // hardlinker. This guarantees that a digest used by N files is only
+        // fetched once but hardlinked N times.
+        let mut digest_to_file_indices: HashMap<DigestInfo, Vec<usize>> = HashMap::new();
+        for (idx, f) in files_to_materialize.iter().enumerate() {
+            digest_to_file_indices
+                .entry(f.digest)
+                .or_default()
+                .push(idx);
+        }
+        let unique_digests: Vec<DigestInfo> = digest_to_file_indices.keys().copied().collect();
+
+        let files_arc = Arc::new(files_to_materialize);
+        let digest_to_file_indices_arc = Arc::new(digest_to_file_indices);
+
+        // Channel: fetcher -> hardlinker. `usize` is the file index in
+        // `files_arc`. Capacity is 2x the hardlink concurrency so the
+        // fetcher can keep the hardlinker fed without unbounded buffering.
+        let (tx, mut rx) = mpsc::channel::<usize>(DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY * 2);
+
+        // ---- Fetcher future ----
+        // Launches all populate_fast_store calls upfront, capped at
+        // DOWNLOAD_TO_DIRECTORY_FETCH_CONCURRENCY concurrent fetches.
+        // As each fetch completes, every file index for that digest is sent.
+        let fetcher_fut = {
+            let files_arc = files_arc.clone();
+            let digest_to_file_indices_arc = digest_to_file_indices_arc.clone();
+            let tx = tx.clone();
+            async move {
+                let result: Result<(), Error> = futures::stream::iter(
+                    unique_digests.into_iter().map(Ok::<_, Error>),
+                )
+                .try_for_each_concurrent(
+                    DOWNLOAD_TO_DIRECTORY_FETCH_CONCURRENCY,
+                    |fetch_digest| {
+                        let tx = tx.clone();
+                        let files_arc = files_arc.clone();
+                        let digest_to_file_indices_arc = digest_to_file_indices_arc.clone();
+                        async move {
+                            // Zero-digest files don't need a fetch - the
+                            // hardlinker creates them by writing an empty
+                            // file. Skip straight to send.
+                            if !is_zero_digest(fetch_digest) {
+                                cas_store
+                                    .populate_fast_store(fetch_digest.into())
+                                    .await
+                                    .map_err(|e| {
+                                        e.append(format!("for digest {fetch_digest}"))
+                                    })?;
+                            }
+                            // Forward every file waiting on this blob.
+                            let indices = digest_to_file_indices_arc
+                                .get(&fetch_digest)
+                                .map_or(&[][..], Vec::as_slice);
+                            for &idx in indices {
+                                // Re-validate the file is still here. If the
+                                // receiver dropped (hardlinker errored out),
+                                // bail with a "channel closed" error that
+                                // try_join3 will surface alongside the real
+                                // failure from the consumer side.
+                                let _ = files_arc.get(idx);
+                                if tx.send(idx).await.is_err() {
+                                    // Hardlinker dropped; nothing left to do.
+                                    return Ok(());
+                                }
+                            }
+                            Ok::<(), Error>(())
+                        }
+                    },
+                )
+                .await;
+                // Drop our sender so the consumer's recv() can return None
+                // once all sends complete (the outer `tx` is also dropped
+                // after the join below, but dropping here lets the consumer
+                // finish cleanly even if directories/symlinks futures take
+                // longer).
+                drop(tx);
+                result
+            }
+        };
+
+        // ---- Hardlinker future ----
+        // Drains the channel and performs hardlink + chmod + set_mtime,
+        // bounded at DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY in flight.
+        let hardlinker_fut = {
+            let files_arc = files_arc.clone();
+            async move {
+                let stream = futures::stream::unfold(&mut rx, |rx| async move {
+                    rx.recv().await.map(|idx| (Ok::<usize, Error>(idx), rx))
+                });
+                stream
+                    .try_for_each_concurrent(
+                        DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY,
+                        |idx| {
+                            let files_arc = files_arc.clone();
+                            async move {
+                                let file = &files_arc[idx];
+                                let dest = file.dest.clone();
+                                let file_digest = file.digest;
+                                if is_zero_digest(file_digest) {
+                                    let mut file_slot = fs::create_file(&dest).await?;
+                                    file_slot.write_all(&[]).await?;
+                                } else {
+                                    let file_entry = filesystem_store
+                                        .get_file_entry_for_digest(&file_digest)
+                                        .await
+                                        .err_tip(|| "During hard link")?;
+                                    // TODO: add a test for #2051: deadlock with large number of files
+                                    let src_path = file_entry
+                                        .get_file_path_locked(|src| async move {
+                                            Ok(PathBuf::from(src))
+                                        })
+                                        .await?;
+                                    fs::hard_link(&src_path, &dest).await.map_err(|e| {
+                                        if e.code == Code::NotFound {
+                                            e.append(format!(
+                                                "Could not make hardlink to {dest}, file was likely evicted from cache.\n\
+                                                This error often occurs when the filesystem store's max_bytes is too small for your workload.\n\
+                                                To fix this issue:\n\
+                                                1. Increase the 'max_bytes' value in your filesystem store configuration\n\
+                                                2. Example: Change 'max_bytes: 10000000000' to 'max_bytes: 50000000000' (or higher)\n\
+                                                3. The setting is typically found in your nativelink.json config under:\n\
+                                                stores -> [your_filesystem_store] -> filesystem -> eviction_policy -> max_bytes\n\
+                                                4. Restart NativeLink after making the change\n\n\
+                                                If this error persists after increasing max_bytes several times, please report at:\n\
+                                                https://github.com/TraceMachina/nativelink/issues\n\
+                                                Include your config file and both server and client logs to help us assist you."
+                                            ))
+                                        } else {
+                                            e.append(format!("Could not make hardlink to {dest}"))
+                                        }
+                                    })?;
+                                }
+                                #[cfg(target_family = "unix")]
+                                if let Some(unix_mode) = file.unix_mode {
+                                    fs::set_permissions(&dest, Permissions::from_mode(unix_mode))
+                                        .await
+                                        .err_tip(|| {
+                                            format!(
+                                                "Could not set unix mode in download_to_directory {dest}"
+                                            )
+                                        })?;
+                                }
+                                if let Some((mtime_seconds, mtime_nanos_i32)) = file.mtime {
+                                    let mtime_nanos = mtime_nanos_i32 as u32;
+                                    let dest_for_mtime = dest.clone();
+                                    spawn_blocking!(
+                                        "download_to_directory_set_mtime",
+                                        move || {
+                                            set_file_mtime(
+                                                &dest_for_mtime,
+                                                FileTime::from_unix_time(
+                                                    mtime_seconds,
+                                                    mtime_nanos,
+                                                ),
+                                            )
+                                            .err_tip(|| {
+                                                format!(
+                                                    "Failed to set mtime in download_to_directory {dest_for_mtime}"
+                                                )
+                                            })
+                                        }
+                                    )
+                                    .await
+                                    .err_tip(
+                                        || "Failed to launch spawn_blocking in download_to_directory",
+                                    )??;
+                                }
+                                Ok::<(), Error>(())
+                            }
+                        },
+                    )
+                    .await
+            }
+        };
+
+        // ---- Directory + symlink futures ----
+        // These run alongside the file fetcher/hardlinker. They're separate
+        // from the files pipeline because they don't fetch blobs; they're
+        // collected into a FuturesUnordered drained at the same time as
+        // the fetcher/hardlinker via try_join3.
+        let mut extras = FuturesUnordered::new();
+        for directory_node in directory.directories {
+            let directory_node_digest: DigestInfo = directory_node
                 .digest
                 .err_tip(|| "Expected Digest to exist in Directory::directories::digest")?
                 .try_into()
                 .err_tip(|| "In Directory::file::digest")?;
-            let new_directory_path = format!("{}/{}", current_directory, directory.name);
-            futures.push(
+            let new_directory_path = format!("{}/{}", current_directory, directory_node.name);
+            extras.push(
                 async move {
                     fs::create_dir(&new_directory_path)
                         .await
@@ -243,12 +410,12 @@ pub fn download_to_directory<'a>(
                     download_to_directory(
                         cas_store,
                         filesystem_store,
-                        &digest,
+                        &directory_node_digest,
                         &new_directory_path,
                     )
                     .await
                     .err_tip(|| format!("in download_to_directory : {new_directory_path}"))?;
-                    Ok(())
+                    Ok::<(), Error>(())
                 }
                 .boxed(),
             );
@@ -257,7 +424,7 @@ pub fn download_to_directory<'a>(
         #[cfg(target_family = "unix")]
         for symlink_node in directory.symlinks {
             let dest = format!("{}/{}", current_directory, symlink_node.name);
-            futures.push(
+            extras.push(
                 async move {
                     fs::symlink(&symlink_node.target, &dest).await.err_tip(|| {
                         format!(
@@ -270,16 +437,17 @@ pub fn download_to_directory<'a>(
                 .boxed(),
             );
         }
+        let extras_fut = async move {
+            while extras.try_next().await?.is_some() {}
+            Ok::<(), Error>(())
+        };
 
-        // Gate concurrency: at most DOWNLOAD_TO_DIRECTORY_CONCURRENCY futures
-        // polled at once for this directory level. Previously all futures were
-        // pushed into an unbounded FuturesUnordered, which on macOS produced
-        // thousands of parallel hardlink(2) calls fighting APFS's per-volume
-        // metadata lock and regressing throughput vs serial.
-        futures::stream::iter(futures)
-            .buffer_unordered(DOWNLOAD_TO_DIRECTORY_CONCURRENCY)
-            .try_collect::<Vec<_>>()
-            .await?;
+        // Drop the original sender clone in this scope so that once the
+        // fetcher's clone is dropped (after it sends everything), the
+        // hardlinker's recv() returns None.
+        drop(tx);
+
+        try_join3(fetcher_fut, hardlinker_fut, extras_fut).await?;
         Ok(())
     }
     .boxed()
