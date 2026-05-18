@@ -152,7 +152,11 @@ fn hardlink_directory_tree_recursive<'a>(
 /// * `dir` - Directory to make read-only
 ///
 /// # Platform Notes
-/// - Unix: Sets permissions to 0o555 (r-xr-xr-x)
+/// - Unix: Sets permissions to 0o555 (r-xr-xr-x) for both files and directories.
+///   Files use 0o555 (not 0o444) so shell scripts that some build rules mark
+///   as `is_executable=false` (e.g. `rules_cc`/`rules_rust` wrappers) remain
+///   executable when the directory tree is hardlinked into action workspaces.
+///   Hermeticity is preserved by leaving the write bits clear.
 /// - Windows: Sets `FILE_ATTRIBUTE_READONLY`
 pub async fn set_readonly_recursive(dir: &Path) -> Result<(), Error> {
     error_if!(!dir.exists(), "Directory does not exist: {}", dir.display());
@@ -186,10 +190,13 @@ fn set_readonly_one_path(
             use std::os::unix::fs::PermissionsExt;
             let mut perms = metadata.permissions();
 
-            // If it's a directory, set to r-xr-xr-x (555)
-            // If it's a file, set to r--r--r-- (444)
-            let mode = if metadata.is_dir() { 0o555 } else { 0o444 };
-            perms.set_mode(mode);
+            // Always use 0o555 (r-xr-xr-x) for both files and directories.
+            // Files keep the execute bit so shell scripts that build rules
+            // sometimes mark as `is_executable=false` (cc_wrapper.sh,
+            // lto_linker_wrapper.sh, toolchain wrappers) remain runnable
+            // once a cached directory is hardlinked into an action workspace.
+            // Hermeticity is preserved: no write bits are set.
+            perms.set_mode(0o555);
 
             fs::set_permissions(&path, perms)
                 .await

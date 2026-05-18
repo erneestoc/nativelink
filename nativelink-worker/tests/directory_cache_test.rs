@@ -230,3 +230,73 @@ async fn evict_with_directory_entry() -> Result<(), Error> {
     ));
     Ok(())
 }
+
+/// Regression test for the EPERM-on-shell-scripts bug in `DirectoryCache`.
+///
+/// Some build rules (`rules_cc`, `rules_rust`, `rules_swift`) mark
+/// shell-script toolchain wrappers (e.g. `cc_wrapper.sh`,
+/// `lto_linker_wrapper.sh`) as `is_executable = false` in the REAPI
+/// `FileNode`, even though the action needs to exec them. The previous
+/// code only set executable bits when `is_executable=true`, then
+/// `set_readonly_recursive` would force non-executable files to `0o444`,
+/// breaking shell-script exec at action runtime. The fix sets all cached
+/// files to `0o555` (read+execute, no write — hermeticity preserved).
+#[cfg(target_family = "unix")]
+#[nativelink_test]
+async fn cached_non_executable_shell_script_gets_0o555() -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;
+
+    use tokio::fs;
+
+    const SHELL_SCRIPT_NAME: &str = "lto_linker_wrapper.sh";
+    const SHELL_SCRIPT_CONTENT: &[u8] = b"#!/bin/sh\nexec \"$@\"\n";
+
+    let cache_root: PathBuf = make_temp_path("directory_cache_eperm").into();
+    let working_directory: PathBuf = make_temp_path("working_directory_eperm").into();
+
+    let store = MemoryStore::new(&MemorySpec::default());
+
+    let script_digest = DigestInfo::new([0x9au8; 32], SHELL_SCRIPT_CONTENT.len() as u64);
+    store
+        .update_oneshot(script_digest, Bytes::from_static(SHELL_SCRIPT_CONTENT))
+        .await?;
+
+    let directory_proto = ProtoDirectory {
+        files: vec![FileNode {
+            name: SHELL_SCRIPT_NAME.to_string(),
+            digest: Some(script_digest.into()),
+            // Reproduce the upstream bug condition: rules_cc/rules_rust
+            // set is_executable=false on shell-script wrappers.
+            is_executable: false,
+            node_properties: None,
+        }],
+        ..Default::default()
+    };
+    let dir_bytes = Bytes::from(directory_proto.encode_to_vec());
+    let dir_digest = DigestInfo::new([0x9bu8; 32], dir_bytes.len() as u64);
+    store.update_oneshot(dir_digest, dir_bytes).await?;
+
+    let config = DirectoryCacheConfig {
+        cache_root,
+        ..Default::default()
+    };
+    let cache = DirectoryCache::new(config, Store::new(store)).await?;
+
+    let dest = working_directory.join("materialized");
+    let hit = cache.get_or_create(dir_digest, dest.as_path()).await?;
+    assert!(!hit, "First materialization should be a cache miss");
+
+    let script_path = dest.join(SHELL_SCRIPT_NAME);
+    let metadata = fs::metadata(&script_path).await?;
+    let mode = metadata.permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o555,
+        "Non-executable shell script in DirectoryCache must be 0o555 to avoid \
+         EPERM when toolchain wrappers exec it; got 0o{mode:o}"
+    );
+    assert!(
+        metadata.permissions().readonly(),
+        "Cached file must remain read-only for hermeticity"
+    );
+    Ok(())
+}

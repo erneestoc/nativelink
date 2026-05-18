@@ -289,15 +289,20 @@ impl DirectoryCache {
             .await
             .err_tip(|| format!("Failed to write file: {}", file_path.display()))?;
 
-        // Set permissions
+        // Always set 0o555 to match CAS store defaults. Some build tools
+        // (`rules_cc`, `rules_rust`, `rules_swift`) set `is_executable=false`
+        // on shell scripts that must be executable (cc_wrapper.sh,
+        // lto_linker_wrapper.sh, toolchain wrappers); 0o555 as the base
+        // avoids EPERM on cached executables while preserving hermeticity
+        // (no write bit).
         #[cfg(unix)]
-        if file_node.is_executable {
+        {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = fs::metadata(&file_path)
                 .await
                 .err_tip(|| "Failed to get file metadata")?
                 .permissions();
-            perms.set_mode(0o755);
+            perms.set_mode(0o555);
             fs::set_permissions(&file_path, perms)
                 .await
                 .err_tip(|| "Failed to set file permissions")?;
