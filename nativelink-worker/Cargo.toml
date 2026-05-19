@@ -83,3 +83,12 @@ which = { version = "8.0.2", default-features = false, features = ["real-sys"] }
 [package.metadata.cargo-machete]
 # Used by nativelink_test macro
 ignored = ["tracing-test"]
+
+[dev-dependencies.criterion]
+version = "0.5"
+default-features = false
+features = ["async_tokio"]
+
+[[bench]]
+name = "download_to_directory_concurrent_fetch"
+harness = false
