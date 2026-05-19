@@ -295,10 +295,40 @@ pub fn download_to_directory<'a>(
         let files_arc = Arc::new(files_to_materialize);
         let digest_to_file_indices_arc = Arc::new(digest_to_file_indices);
 
-        // Channel: fetcher -> hardlinker. `usize` is the file index in
-        // `files_arc`. Capacity is 2x the hardlink concurrency so the
-        // fetcher can keep the hardlinker fed without unbounded buffering.
-        let (tx, mut rx) = mpsc::channel::<usize>(DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY * 2);
+        // Channel: fetcher -> hardlinker. Item is (file_index, source_path).
+        // The source path is shared via Arc so the N files referencing the
+        // same digest reuse a single resolved CAS path - avoiding N-1
+        // redundant `get_file_entry_for_digest` + `get_file_path_locked`
+        // lookups per unique digest in the hardlinker. `None` means
+        // "synthesize a zero-byte file" (zero-digest fast path).
+        //
+        // Capacity is 2x the hardlink concurrency so the fetcher can keep
+        // the hardlinker fed without unbounded buffering.
+        type HardlinkItem = (usize, Option<Arc<PathBuf>>);
+        let (tx, mut rx) =
+            mpsc::channel::<HardlinkItem>(DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY * 2);
+
+        // Helper: resolve one digest in the fast store to a shared
+        // `Arc<PathBuf>` pointing at its CAS file. Called once per unique
+        // digest by the fetcher; the resulting Arc is cloned into each
+        // hardlink message that references this digest. Zero-digests are
+        // handled by the hardlinker itself and return `None` here.
+        async fn resolve_digest_path(
+            filesystem_store: Pin<&FilesystemStore>,
+            digest: DigestInfo,
+        ) -> Result<Option<Arc<PathBuf>>, Error> {
+            if is_zero_digest(digest) {
+                return Ok(None);
+            }
+            let file_entry = filesystem_store
+                .get_file_entry_for_digest(&digest)
+                .await
+                .err_tip(|| "During hard link path resolution")?;
+            let src_path = file_entry
+                .get_file_path_locked(|src| async move { Ok(PathBuf::from(src)) })
+                .await?;
+            Ok(Some(Arc::new(src_path)))
+        }
 
         // ---- Fetcher future ----
         // Launches all populate_fast_store calls upfront, capped at
@@ -311,19 +341,39 @@ pub fn download_to_directory<'a>(
             let tx = tx.clone();
             async move {
                 // Fast-path send for everything already in the fast store.
-                // This runs before any fetch so the hardlinker is kept busy
-                // immediately on warm-cache workloads.
-                for hit_digest in &prequalified_hits {
-                    let indices = digest_to_file_indices_arc
-                        .get(hit_digest)
-                        .map_or(&[][..], Vec::as_slice);
-                    for &idx in indices {
-                        let _ = files_arc.get(idx);
-                        if tx.send(idx).await.is_err() {
-                            drop(tx);
-                            return Ok(());
+                // Resolve each hit digest to a CAS path once, then forward
+                // (idx, Arc<PathBuf>) for every file referencing it. The
+                // path resolutions for distinct hit digests run in parallel
+                // to overlap their (cheap) `evicting_map.get()` locks.
+                let hit_resolutions = futures::stream::iter(
+                    prequalified_hits.iter().copied().map(Ok::<_, Error>),
+                )
+                .try_for_each_concurrent(
+                    DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY,
+                    |hit_digest| {
+                        let tx = tx.clone();
+                        let files_arc = files_arc.clone();
+                        let digest_to_file_indices_arc = digest_to_file_indices_arc.clone();
+                        async move {
+                            let resolved =
+                                resolve_digest_path(filesystem_store, hit_digest).await?;
+                            let indices = digest_to_file_indices_arc
+                                .get(&hit_digest)
+                                .map_or(&[][..], Vec::as_slice);
+                            for &idx in indices {
+                                let _ = files_arc.get(idx);
+                                if tx.send((idx, resolved.clone())).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                            Ok::<(), Error>(())
                         }
-                    }
+                    },
+                )
+                .await;
+                if let Err(e) = hit_resolutions {
+                    drop(tx);
+                    return Err(e);
                 }
 
                 let result: Result<(), Error> = futures::stream::iter(
@@ -342,7 +392,10 @@ pub fn download_to_directory<'a>(
                                 .map_err(|e| {
                                     e.append(format!("for digest {fetch_digest}"))
                                 })?;
-                            // Forward every file waiting on this blob.
+                            // Resolve the CAS path once for this digest...
+                            let resolved =
+                                resolve_digest_path(filesystem_store, fetch_digest).await?;
+                            // ...then forward every file waiting on this blob.
                             let indices = digest_to_file_indices_arc
                                 .get(&fetch_digest)
                                 .map_or(&[][..], Vec::as_slice);
@@ -353,7 +406,7 @@ pub fn download_to_directory<'a>(
                                 // try_join3 will surface alongside the real
                                 // failure from the consumer side.
                                 let _ = files_arc.get(idx);
-                                if tx.send(idx).await.is_err() {
+                                if tx.send((idx, resolved.clone())).await.is_err() {
                                     // Hardlinker dropped; nothing left to do.
                                     return Ok(());
                                 }
@@ -376,54 +429,52 @@ pub fn download_to_directory<'a>(
         // ---- Hardlinker future ----
         // Drains the channel and performs hardlink + chmod + set_mtime,
         // bounded at DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY in flight.
+        // The source path was already resolved by the fetcher and arrives
+        // in the channel message - the hardlinker never touches the
+        // FilesystemStore directly.
         let hardlinker_fut = {
             let files_arc = files_arc.clone();
             async move {
                 let stream = futures::stream::unfold(&mut rx, |rx| async move {
-                    rx.recv().await.map(|idx| (Ok::<usize, Error>(idx), rx))
+                    rx.recv()
+                        .await
+                        .map(|item| (Ok::<HardlinkItem, Error>(item), rx))
                 });
                 stream
                     .try_for_each_concurrent(
                         DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY,
-                        |idx| {
+                        |(idx, maybe_src_path)| {
                             let files_arc = files_arc.clone();
                             async move {
                                 let file = &files_arc[idx];
                                 let dest = file.dest.clone();
-                                let file_digest = file.digest;
-                                if is_zero_digest(file_digest) {
-                                    let mut file_slot = fs::create_file(&dest).await?;
-                                    file_slot.write_all(&[]).await?;
-                                } else {
-                                    let file_entry = filesystem_store
-                                        .get_file_entry_for_digest(&file_digest)
-                                        .await
-                                        .err_tip(|| "During hard link")?;
-                                    // TODO: add a test for #2051: deadlock with large number of files
-                                    let src_path = file_entry
-                                        .get_file_path_locked(|src| async move {
-                                            Ok(PathBuf::from(src))
-                                        })
-                                        .await?;
-                                    fs::hard_link(&src_path, &dest).await.map_err(|e| {
-                                        if e.code == Code::NotFound {
-                                            e.append(format!(
-                                                "Could not make hardlink to {dest}, file was likely evicted from cache.\n\
-                                                This error often occurs when the filesystem store's max_bytes is too small for your workload.\n\
-                                                To fix this issue:\n\
-                                                1. Increase the 'max_bytes' value in your filesystem store configuration\n\
-                                                2. Example: Change 'max_bytes: 10000000000' to 'max_bytes: 50000000000' (or higher)\n\
-                                                3. The setting is typically found in your nativelink.json config under:\n\
-                                                stores -> [your_filesystem_store] -> filesystem -> eviction_policy -> max_bytes\n\
-                                                4. Restart NativeLink after making the change\n\n\
-                                                If this error persists after increasing max_bytes several times, please report at:\n\
-                                                https://github.com/TraceMachina/nativelink/issues\n\
-                                                Include your config file and both server and client logs to help us assist you."
-                                            ))
-                                        } else {
-                                            e.append(format!("Could not make hardlink to {dest}"))
-                                        }
-                                    })?;
+                                match maybe_src_path {
+                                    None => {
+                                        // Zero-digest fast path.
+                                        let mut file_slot = fs::create_file(&dest).await?;
+                                        file_slot.write_all(&[]).await?;
+                                    }
+                                    Some(src_path) => {
+                                        fs::hard_link(src_path.as_ref(), &dest).await.map_err(|e| {
+                                            if e.code == Code::NotFound {
+                                                e.append(format!(
+                                                    "Could not make hardlink to {dest}, file was likely evicted from cache.\n\
+                                                    This error often occurs when the filesystem store's max_bytes is too small for your workload.\n\
+                                                    To fix this issue:\n\
+                                                    1. Increase the 'max_bytes' value in your filesystem store configuration\n\
+                                                    2. Example: Change 'max_bytes: 10000000000' to 'max_bytes: 50000000000' (or higher)\n\
+                                                    3. The setting is typically found in your nativelink.json config under:\n\
+                                                    stores -> [your_filesystem_store] -> filesystem -> eviction_policy -> max_bytes\n\
+                                                    4. Restart NativeLink after making the change\n\n\
+                                                    If this error persists after increasing max_bytes several times, please report at:\n\
+                                                    https://github.com/TraceMachina/nativelink/issues\n\
+                                                    Include your config file and both server and client logs to help us assist you."
+                                                ))
+                                            } else {
+                                                e.append(format!("Could not make hardlink to {dest}"))
+                                            }
+                                        })?;
+                                    }
                                 }
                                 #[cfg(target_family = "unix")]
                                 if let Some(unix_mode) = file.unix_mode {
