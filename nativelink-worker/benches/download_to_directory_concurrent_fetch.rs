@@ -285,6 +285,21 @@ struct Workload {
     fetch_latency: Option<Duration>,
 }
 
+/// Long-lived per-workload state. Holds the slow store (with blobs and the
+/// directory proto already populated) so we can rebuild a fresh fast store
+/// per iteration to measure the cold-cache path that matches production
+/// (every Bazel action arrives with a unique input set; the directory cache
+/// short-circuits warm-cache reuse, so by the time `download_to_directory`
+/// is called the fast store has none of the action's blobs).
+struct BlobBank {
+    inner_slow: Arc<MemoryStore>,
+    root_digest: DigestInfo,
+    fetch_latency: Option<Duration>,
+}
+
+/// Per-iteration fixture: a freshly constructed FastSlowStore wrapping a
+/// freshly constructed FilesystemStore. The slow store is the shared
+/// `BlobBank` so we don't pay re-population cost on every iteration.
 struct Fixture {
     _tempdir: TempDir,
     cas_store: Arc<FastSlowStore>,
@@ -292,55 +307,22 @@ struct Fixture {
     root_digest: DigestInfo,
 }
 
-async fn build_fixture(w: &Workload, idx: usize) -> Result<Fixture, Error> {
-    let tempdir = tempfile::tempdir()
-        .map_err(|e| nativelink_error::make_err!(Code::Internal, "tempdir: {e}"))?;
-    let content_path = tempdir.path().join(format!("content_{idx}"));
-    let temp_path = tempdir.path().join(format!("temp_{idx}"));
-    let fast_config = FilesystemSpec {
-        content_path: content_path.to_string_lossy().into_owned(),
-        temp_path: temp_path.to_string_lossy().into_owned(),
-        eviction_policy: None,
-        ..Default::default()
-    };
-    let fast_store = FilesystemStore::new(&fast_config).await?;
+async fn build_blob_bank(w: &Workload) -> Result<BlobBank, Error> {
     let inner_slow = MemoryStore::new(&MemorySpec::default());
 
     // Build unique blobs in inner_slow.
     let mut unique_digests: Vec<DigestInfo> = Vec::with_capacity(w.num_unique_digests);
     for i in 0..w.num_unique_digests {
-        // Generate body of file_size_bytes; vary first 8 bytes by i.
         let mut body = vec![0u8; w.file_size_bytes];
         let id = (i as u64).to_le_bytes();
         let prefix_len = 8.min(body.len());
         body[..prefix_len].copy_from_slice(&id[..prefix_len]);
-        // Hash via Blake3 to get a real digest. finalize_digest sets size
-        // from the cumulative update length, so no manual override needed.
         let mut hasher = DigestHasherFunc::Blake3.hasher();
         hasher.update(&body);
         let digest = hasher.finalize_digest();
         inner_slow.update_oneshot(digest, body.into()).await?;
         unique_digests.push(digest);
     }
-
-    // Wire slow store (optionally with latency injection).
-    let slow_store: Store = if let Some(d) = w.fetch_latency {
-        let delayed = DelayedStore::new(inner_slow.clone(), d);
-        Store::new(delayed)
-    } else {
-        Store::new(inner_slow.clone())
-    };
-
-    let cas_store = FastSlowStore::new(
-        &FastSlowSpec {
-            fast: StoreSpec::Filesystem(fast_config.clone()),
-            slow: StoreSpec::Memory(MemorySpec::default()),
-            fast_direction: StoreDirection::default(),
-            slow_direction: StoreDirection::default(),
-        },
-        Store::new(fast_store.clone()),
-        slow_store,
-    );
 
     // Build root Directory referencing N files, each pointing at one of the
     // unique digests (round-robin).
@@ -366,11 +348,46 @@ async fn build_fixture(w: &Workload, idx: usize) -> Result<Fixture, Error> {
         .update_oneshot(root_digest, dir_bytes.into())
         .await?;
 
+    Ok(BlobBank {
+        inner_slow,
+        root_digest,
+        fetch_latency: w.fetch_latency,
+    })
+}
+
+async fn build_fixture(bank: &BlobBank, idx: usize) -> Result<Fixture, Error> {
+    let tempdir = tempfile::tempdir()
+        .map_err(|e| nativelink_error::make_err!(Code::Internal, "tempdir: {e}"))?;
+    let content_path = tempdir.path().join(format!("content_{idx}"));
+    let temp_path = tempdir.path().join(format!("temp_{idx}"));
+    let fast_config = FilesystemSpec {
+        content_path: content_path.to_string_lossy().into_owned(),
+        temp_path: temp_path.to_string_lossy().into_owned(),
+        eviction_policy: None,
+        ..Default::default()
+    };
+    let fast_store = FilesystemStore::new(&fast_config).await?;
+    let slow_store: Store = if let Some(d) = bank.fetch_latency {
+        let delayed = DelayedStore::new(bank.inner_slow.clone(), d);
+        Store::new(delayed)
+    } else {
+        Store::new(bank.inner_slow.clone())
+    };
+    let cas_store = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Filesystem(fast_config.clone()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        Store::new(fast_store.clone()),
+        slow_store,
+    );
     Ok(Fixture {
         _tempdir: tempdir,
         cas_store,
         fast_store,
-        root_digest,
+        root_digest: bank.root_digest,
     })
 }
 
@@ -482,19 +499,29 @@ fn bench_download(c: &mut Criterion) {
         let throughput_bytes = (w.num_unique_digests as u64) * (w.file_size_bytes as u64);
         group.throughput(Throughput::Bytes(throughput_bytes));
 
+        // The blob bank (slow store + digests + dir proto) is shared across
+        // all iterations of this workload. The FastSlowStore + FilesystemStore
+        // are rebuilt per iteration so each iter exercises the cold-cache
+        // path - matching production where every Bazel action arrives with
+        // a unique input set.
+        let bank = rt.block_on(build_blob_bank(&w)).expect("build_blob_bank");
+
         for (id_name, is_baseline) in [("baseline", true), ("new", false)] {
             let bench_id = BenchmarkId::new(id_name, w.name);
-            // Build fixture once per (variant, workload) pair.
-            let fx = rt.block_on(build_fixture(&w, 0)).expect("build_fixture");
             group.bench_with_input(bench_id, &w.name, |b, _| {
                 let iter_idx = std::cell::Cell::new(0u64);
                 b.to_async(&rt).iter_custom(|iters| {
-                    let fx = &fx;
+                    let bank = &bank;
                     let iter_idx = &iter_idx;
                     async move {
                         let mut total = Duration::ZERO;
                         for _ in 0..iters {
                             iter_idx.set(iter_idx.get() + 1);
+                            // Fresh fast store + cas store per iter => cold
+                            // cache for this iteration's run.
+                            let fx = build_fixture(bank, iter_idx.get() as usize)
+                                .await
+                                .expect("build_fixture");
                             let dest = tempfile::tempdir().expect("tempdir");
                             let dest_root = dest
                                 .path()
@@ -502,12 +529,13 @@ fn bench_download(c: &mut Criterion) {
                                 .to_string_lossy()
                                 .into_owned();
                             let t0 = std::time::Instant::now();
-                            run_once(is_baseline, fx, &dest_root)
+                            run_once(is_baseline, &fx, &dest_root)
                                 .await
                                 .expect("run_once");
                             total += t0.elapsed();
                             criterion::black_box(&dest_root);
                             drop(dest);
+                            drop(fx);
                         }
                         total
                     }

@@ -66,7 +66,7 @@ use nativelink_util::action_messages::{
 use nativelink_util::common::{DigestInfo, fs};
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
 use nativelink_util::metrics_utils::{AsyncCounterWrapper, CounterWithTime};
-use nativelink_util::store_trait::{Store, StoreLike, UploadSizeInfo};
+use nativelink_util::store_trait::{Store, StoreKey, StoreLike, UploadSizeInfo};
 use nativelink_util::{background_spawn, spawn, spawn_blocking};
 use parking_lot::Mutex;
 use prost::Message;
@@ -127,6 +127,14 @@ const DOWNLOAD_TO_DIRECTORY_FETCH_CONCURRENCY: usize = 128;
 /// Composes with `DOWNLOAD_TO_DIRECTORY_FETCH_CONCURRENCY`: fetch and
 /// hardlink phases overlap, each with its own bound.
 const DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY: usize = 64;
+
+/// Minimum number of unique digests at a directory level before the batched
+/// `has_with_results` prequalification step pays for itself. Below this the
+/// added round-trip is more expensive than the serial `has()` calls it
+/// avoids inside `populate_fast_store`. Tuned from microbench:
+/// 64 cold unique digests regressed ~20% with prequalification; 198 unique
+/// digests improved ~17%. 96 is the conservative midpoint.
+const DOWNLOAD_TO_DIRECTORY_PREQUALIFY_MIN_UNIQUE: usize = 96;
 
 /// Per-file work item materialized by `download_to_directory`. Collected up
 /// front so the fetcher (concurrent blob fetch) and hardlinker (concurrent
@@ -225,6 +233,65 @@ pub fn download_to_directory<'a>(
         }
         let unique_digests: Vec<DigestInfo> = digest_to_file_indices.keys().copied().collect();
 
+        // ---- Batched prequalification ----
+        // Above DOWNLOAD_TO_DIRECTORY_PREQUALIFY_MIN_UNIQUE unique digests,
+        // ask the fast store in a single batched `has_with_results` call
+        // which blobs are already local. `populate_fast_store` would
+        // otherwise pay one serial `has()` lock acquisition per unique
+        // digest before deciding to skip the fetch; on workloads with
+        // thousands of inputs this lock-acquisition tax adds up.
+        //
+        // Below the threshold the extra round-trip costs more than the
+        // serial has() calls it avoids, so we keep the simple "feed all
+        // unique digests to the fetcher" path.
+        //
+        // After this step:
+        //   * `prequalified_hits`: digests already in the fast store; their
+        //     files can be forwarded to the hardlinker immediately, skipping
+        //     `populate_fast_store` entirely.
+        //   * `digests_to_fetch`: digests we actually need to fetch.
+        //
+        // Zero-digest entries always go through the hardlinker path (it
+        // synthesizes the empty file), so they're treated as hits.
+        let (prequalified_hits, digests_to_fetch): (Vec<DigestInfo>, Vec<DigestInfo>) =
+            if unique_digests.len() >= DOWNLOAD_TO_DIRECTORY_PREQUALIFY_MIN_UNIQUE {
+                let keys: Vec<StoreKey<'_>> = unique_digests
+                    .iter()
+                    .map(|d| StoreKey::from(*d))
+                    .collect();
+                let mut results: Vec<Option<u64>> = vec![None; keys.len()];
+                cas_store
+                    .fast_store()
+                    .has_with_results(&keys, &mut results)
+                    .await
+                    .err_tip(|| "prequalify has_with_results in download_to_directory")?;
+                let mut hits = Vec::with_capacity(unique_digests.len());
+                let mut misses = Vec::with_capacity(unique_digests.len());
+                for (d, r) in unique_digests.iter().zip(results.iter()) {
+                    if r.is_some() || is_zero_digest(*d) {
+                        hits.push(*d);
+                    } else {
+                        misses.push(*d);
+                    }
+                }
+                (hits, misses)
+            } else {
+                // Below threshold: skip the batched prequalification.
+                // Zero digests still get the hardlinker fast path - split
+                // them out here so the fetcher loop doesn't try to
+                // populate_fast_store for them (it always returns Ok).
+                let mut hits = Vec::new();
+                let mut misses = Vec::with_capacity(unique_digests.len());
+                for d in &unique_digests {
+                    if is_zero_digest(*d) {
+                        hits.push(*d);
+                    } else {
+                        misses.push(*d);
+                    }
+                }
+                (hits, misses)
+            };
+
         let files_arc = Arc::new(files_to_materialize);
         let digest_to_file_indices_arc = Arc::new(digest_to_file_indices);
 
@@ -236,14 +303,31 @@ pub fn download_to_directory<'a>(
         // ---- Fetcher future ----
         // Launches all populate_fast_store calls upfront, capped at
         // DOWNLOAD_TO_DIRECTORY_FETCH_CONCURRENCY concurrent fetches.
-        // As each fetch completes, every file index for that digest is sent.
+        // Only iterates over `digests_to_fetch` (prequalified misses);
+        // hits were already enqueued above.
         let fetcher_fut = {
             let files_arc = files_arc.clone();
             let digest_to_file_indices_arc = digest_to_file_indices_arc.clone();
             let tx = tx.clone();
             async move {
+                // Fast-path send for everything already in the fast store.
+                // This runs before any fetch so the hardlinker is kept busy
+                // immediately on warm-cache workloads.
+                for hit_digest in &prequalified_hits {
+                    let indices = digest_to_file_indices_arc
+                        .get(hit_digest)
+                        .map_or(&[][..], Vec::as_slice);
+                    for &idx in indices {
+                        let _ = files_arc.get(idx);
+                        if tx.send(idx).await.is_err() {
+                            drop(tx);
+                            return Ok(());
+                        }
+                    }
+                }
+
                 let result: Result<(), Error> = futures::stream::iter(
-                    unique_digests.into_iter().map(Ok::<_, Error>),
+                    digests_to_fetch.into_iter().map(Ok::<_, Error>),
                 )
                 .try_for_each_concurrent(
                     DOWNLOAD_TO_DIRECTORY_FETCH_CONCURRENCY,
@@ -252,17 +336,12 @@ pub fn download_to_directory<'a>(
                         let files_arc = files_arc.clone();
                         let digest_to_file_indices_arc = digest_to_file_indices_arc.clone();
                         async move {
-                            // Zero-digest files don't need a fetch - the
-                            // hardlinker creates them by writing an empty
-                            // file. Skip straight to send.
-                            if !is_zero_digest(fetch_digest) {
-                                cas_store
-                                    .populate_fast_store(fetch_digest.into())
-                                    .await
-                                    .map_err(|e| {
-                                        e.append(format!("for digest {fetch_digest}"))
-                                    })?;
-                            }
+                            cas_store
+                                .populate_fast_store(fetch_digest.into())
+                                .await
+                                .map_err(|e| {
+                                    e.append(format!("for digest {fetch_digest}"))
+                                })?;
                             // Forward every file waiting on this blob.
                             let indices = digest_to_file_indices_arc
                                 .get(&fetch_digest)
@@ -541,7 +620,7 @@ async fn upload_file(
             // Only upload if the digest doesn't already exist, this should be
             // a much cheaper operation than an upload.
             let cas_store = cas_store.as_store_driver_pin();
-            let store_key: nativelink_util::store_trait::StoreKey<'_> = digest.into();
+            let store_key: StoreKey<'_> = digest.into();
             let has_start = std::time::Instant::now();
             if cas_store
                 .has(store_key.borrow())
