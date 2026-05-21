@@ -1290,6 +1290,20 @@ pub struct GrpcSpec {
     /// context (`traceparent` / `tracestate`) into every outgoing request.
     #[serde(default)]
     pub forward_headers: Vec<String>,
+
+    /// Upper bound (bytes) on the total blob size packed into one
+    /// `BatchReadBlobs` request when this store serves a batched read.
+    ///
+    /// The store discovers the upstream's advertised
+    /// `max_batch_total_size_bytes` via the `GetCapabilities` RPC at first
+    /// use. This option, when non-zero, caps that discovered value: the
+    /// effective limit is `min(discovered, max_batch_size_bytes)`. It cannot
+    /// raise the limit above what the upstream allows.
+    ///
+    /// Leave at 0 (the default) to use the discovered value directly. If
+    /// capabilities discovery fails, a built-in 4MB fallback is used.
+    #[serde(default, deserialize_with = "convert_data_size_with_shellexpand")]
+    pub max_batch_size_bytes: u64,
 }
 
 /// The possible error codes that might occur on an upstream request.
