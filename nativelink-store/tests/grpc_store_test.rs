@@ -9,14 +9,24 @@ use futures::{Stream, StreamExt};
 use nativelink_config::stores::{GrpcEndpoint, GrpcSpec, Retry, StoreType};
 use nativelink_error::{Error, ResultExt};
 use nativelink_macro::nativelink_test;
+use nativelink_proto::build::bazel::remote::execution::v2::capabilities_server::{
+    Capabilities, CapabilitiesServer,
+};
+use nativelink_proto::build::bazel::remote::execution::v2::content_addressable_storage_server::{
+    ContentAddressableStorage, ContentAddressableStorageServer,
+};
 use nativelink_proto::build::bazel::remote::execution::v2::{
-    FindMissingBlobsRequest, digest_function,
+    BatchReadBlobsRequest, BatchReadBlobsResponse, BatchUpdateBlobsRequest,
+    BatchUpdateBlobsResponse, CacheCapabilities, FindMissingBlobsRequest, FindMissingBlobsResponse,
+    GetCapabilitiesRequest, GetTreeRequest, GetTreeResponse, ServerCapabilities,
+    batch_read_blobs_response, compressor, digest_function,
 };
 use nativelink_proto::google::bytestream::byte_stream_server::{ByteStream, ByteStreamServer};
 use nativelink_proto::google::bytestream::{
     QueryWriteStatusRequest, QueryWriteStatusResponse, ReadRequest, ReadResponse, WriteRequest,
     WriteResponse,
 };
+use nativelink_proto::google::rpc::Status as GrpcStatus;
 use nativelink_store::grpc_store::GrpcStore;
 use nativelink_util::background_spawn;
 use nativelink_util::buf_channel::make_buf_channel_pair;
@@ -55,6 +65,7 @@ fn test_spec<T: Into<String>>(endpoint: T, use_legacy_resource_names: bool) -> G
         use_legacy_resource_names,
         headers: HashMap::new(),
         forward_headers: vec![],
+        max_batch_size_bytes: 0,
     }
 }
 
@@ -320,5 +331,205 @@ async fn read_works_with_headers() -> Result<(), Error> {
     );
     drop(cx_guard);
 
+    Ok(())
+}
+
+// ---- BatchReadBlobs (get_many) test harness ----
+//
+// A fake server implementing both ContentAddressableStorage and Capabilities,
+// just enough to exercise GrpcStore::get_many and its capabilities discovery.
+
+#[derive(Debug, Clone)]
+struct FakeCasServer {
+    /// Blob contents the server will return, keyed by digest hash hex.
+    blobs: Arc<Mutex<HashMap<String, bytes::Bytes>>>,
+    /// Every `BatchReadBlobs` request received, for assertions on batching.
+    batch_requests: Arc<Mutex<Vec<BatchReadBlobsRequest>>>,
+    /// Value advertised in `GetCapabilities`' `max_batch_total_size_bytes`.
+    advertised_max_batch_size: i64,
+}
+
+impl FakeCasServer {
+    fn new(advertised_max_batch_size: i64) -> Self {
+        Self {
+            blobs: Arc::new(Mutex::new(HashMap::new())),
+            batch_requests: Arc::new(Mutex::new(vec![])),
+            advertised_max_batch_size,
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl ContentAddressableStorage for FakeCasServer {
+    #[allow(clippy::unimplemented)]
+    async fn find_missing_blobs(
+        &self,
+        _request: Request<FindMissingBlobsRequest>,
+    ) -> Result<Response<FindMissingBlobsResponse>, Status> {
+        unimplemented!("find_missing_blobs not used by get_many tests")
+    }
+
+    #[allow(clippy::unimplemented)]
+    async fn batch_update_blobs(
+        &self,
+        _request: Request<BatchUpdateBlobsRequest>,
+    ) -> Result<Response<BatchUpdateBlobsResponse>, Status> {
+        unimplemented!("batch_update_blobs not used by get_many tests")
+    }
+
+    async fn batch_read_blobs(
+        &self,
+        request: Request<BatchReadBlobsRequest>,
+    ) -> Result<Response<BatchReadBlobsResponse>, Status> {
+        let request = request.into_inner();
+        self.batch_requests.lock().await.push(request.clone());
+        let blobs = self.blobs.lock().await;
+        let responses = request
+            .digests
+            .into_iter()
+            .map(|digest| {
+                let hash = digest.hash.clone();
+                blobs.get(&hash).map_or_else(
+                    || batch_read_blobs_response::Response {
+                        digest: Some(digest.clone()),
+                        data: bytes::Bytes::new(),
+                        compressor: compressor::Value::Identity.into(),
+                        status: Some(GrpcStatus {
+                            code: tonic::Code::NotFound.into(),
+                            message: "missing".to_string(),
+                            details: vec![],
+                        }),
+                    },
+                    |data| batch_read_blobs_response::Response {
+                        digest: Some(digest.clone()),
+                        data: data.clone(),
+                        compressor: compressor::Value::Identity.into(),
+                        status: Some(GrpcStatus::default()),
+                    },
+                )
+            })
+            .collect();
+        Ok(Response::new(BatchReadBlobsResponse { responses }))
+    }
+
+    type GetTreeStream =
+        Pin<Box<dyn Stream<Item = Result<GetTreeResponse, Status>> + Send + 'static>>;
+
+    #[allow(clippy::unimplemented)]
+    async fn get_tree(
+        &self,
+        _request: Request<GetTreeRequest>,
+    ) -> Result<Response<Self::GetTreeStream>, Status> {
+        unimplemented!("get_tree not used by get_many tests")
+    }
+}
+
+#[tonic::async_trait]
+impl Capabilities for FakeCasServer {
+    async fn get_capabilities(
+        &self,
+        _request: Request<GetCapabilitiesRequest>,
+    ) -> Result<Response<ServerCapabilities>, Status> {
+        Ok(Response::new(ServerCapabilities {
+            cache_capabilities: Some(CacheCapabilities {
+                max_batch_total_size_bytes: self.advertised_max_batch_size,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    }
+}
+
+async fn make_fake_cas_server(advertised_max_batch_size: i64) -> (FakeCasServer, u16) {
+    let fake = FakeCasServer::new(advertised_max_batch_size);
+    let listener = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let cas_service = ContentAddressableStorageServer::new(fake.clone());
+    let capabilities_service = CapabilitiesServer::new(fake.clone());
+    background_spawn!("fake_cas_server", async move {
+        Server::builder()
+            .add_service(cas_service)
+            .add_service(capabilities_service)
+            .serve_with_incoming(listener)
+            .await
+            .unwrap();
+    });
+    (fake, port)
+}
+
+/// Hex hash with the low byte set to `n`, distinct per blob.
+fn hash_for(n: u8) -> String {
+    format!("{n:02x}{}", &VALID_HASH[2..])
+}
+
+// get_many fetches several blobs that all fit in one batch and returns each
+// one's bytes positionally; an absent blob comes back as Ok(None).
+#[nativelink_test]
+async fn get_many_batches_and_returns_blobs() -> Result<(), Error> {
+    // Large advertised limit -> everything in one BatchReadBlobs request.
+    let (server, port) = make_fake_cas_server(4 * 1024 * 1024).await;
+    {
+        let mut blobs = server.blobs.lock().await;
+        blobs.insert(hash_for(1), bytes::Bytes::from_static(b"alpha"));
+        blobs.insert(hash_for(3), bytes::Bytes::from_static(b"charlie"));
+    }
+    let spec = test_spec(format!("http://localhost:{port}"), false);
+    let store = GrpcStore::new(&spec).await?;
+
+    let d1 = DigestInfo::try_new(&hash_for(1), 5)?;
+    let d2 = DigestInfo::try_new(&hash_for(2), 9)?; // never inserted
+    let d3 = DigestInfo::try_new(&hash_for(3), 7)?;
+    let keys = [
+        nativelink_util::store_trait::StoreKey::from(d1),
+        nativelink_util::store_trait::StoreKey::from(d2),
+        nativelink_util::store_trait::StoreKey::from(d3),
+    ];
+    let results = store.get_many(&keys).await?;
+    assert_eq!(results.len(), 3);
+    assert_eq!(
+        results[0].as_ref().expect("ok").as_deref(),
+        Some(&b"alpha"[..])
+    );
+    assert_eq!(results[1].as_ref().expect("ok").as_deref(), None);
+    assert_eq!(
+        results[2].as_ref().expect("ok").as_deref(),
+        Some(&b"charlie"[..])
+    );
+
+    // All three digests fit under the 4MB limit -> exactly one batch RPC.
+    assert_eq!(server.batch_requests.lock().await.len(), 1);
+    Ok(())
+}
+
+// When the upstream advertises a small max_batch_total_size_bytes, get_many
+// must split the digests across multiple BatchReadBlobs requests.
+#[nativelink_test]
+async fn get_many_splits_by_advertised_batch_size() -> Result<(), Error> {
+    // Advertise a 10-byte limit; each blob is 8 bytes, so only one blob
+    // fits per batch -> three separate BatchReadBlobs requests.
+    let (server, port) = make_fake_cas_server(10).await;
+    {
+        let mut blobs = server.blobs.lock().await;
+        for n in 1..=3u8 {
+            blobs.insert(hash_for(n), bytes::Bytes::from_static(b"12345678"));
+        }
+    }
+    let spec = test_spec(format!("http://localhost:{port}"), false);
+    let store = GrpcStore::new(&spec).await?;
+
+    let keys: Vec<_> = (1..=3u8)
+        .map(|n| {
+            nativelink_util::store_trait::StoreKey::from(
+                DigestInfo::try_new(&hash_for(n), 8).unwrap(),
+            )
+        })
+        .collect();
+    let results = store.get_many(&keys).await?;
+    assert_eq!(results.len(), 3);
+    for r in &results {
+        assert_eq!(r.as_ref().expect("ok").as_deref(), Some(&b"12345678"[..]));
+    }
+    // 8-byte blobs against a 10-byte limit -> one blob per batch.
+    assert_eq!(server.batch_requests.lock().await.len(), 3);
     Ok(())
 }

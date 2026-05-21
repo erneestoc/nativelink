@@ -15,21 +15,24 @@
 use core::pin::Pin;
 use core::time::Duration;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use futures::stream::{FuturesUnordered, unfold};
 use futures::{Future, Stream, StreamExt, TryFutureExt, TryStreamExt, future};
 use nativelink_config::stores::GrpcSpec;
 use nativelink_error::{Error, ResultExt, error_if, make_err};
 use nativelink_metric::MetricsComponent;
 use nativelink_proto::build::bazel::remote::execution::v2::action_cache_client::ActionCacheClient;
+use nativelink_proto::build::bazel::remote::execution::v2::capabilities_client::CapabilitiesClient;
 use nativelink_proto::build::bazel::remote::execution::v2::content_addressable_storage_client::ContentAddressableStorageClient;
 use nativelink_proto::build::bazel::remote::execution::v2::{
     ActionResult, BatchReadBlobsRequest, BatchReadBlobsResponse, BatchUpdateBlobsRequest,
     BatchUpdateBlobsResponse, FindMissingBlobsRequest, FindMissingBlobsResponse,
-    GetActionResultRequest, GetTreeRequest, GetTreeResponse, UpdateActionResultRequest,
+    GetActionResultRequest, GetCapabilitiesRequest, GetTreeRequest, GetTreeResponse,
+    ServerCapabilities, UpdateActionResultRequest, compressor,
 };
 use nativelink_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use nativelink_proto::google::bytestream::{
@@ -54,6 +57,7 @@ use opentelemetry::global;
 use opentelemetry::propagation::Injector;
 use parking_lot::Mutex;
 use prost::Message;
+use tokio::sync::OnceCell;
 use tokio::time::sleep;
 use tonic::metadata::{Ascii, MetadataKey, MetadataValue};
 use tonic::{Code, IntoRequest, Request, Response, Status, Streaming};
@@ -119,6 +123,13 @@ pub struct GrpcStore {
     use_legacy_resource_names: bool,
     headers: Vec<(MetadataKey<Ascii>, MetadataValue<Ascii>)>,
     forward_headers: Vec<String>,
+    /// Operator-configured cap (bytes) on a single `BatchReadBlobs` request.
+    /// `0` means "no override; use the discovered value directly".
+    max_batch_size_config_override: u64,
+    /// Lazily-discovered effective `BatchReadBlobs` size limit (bytes),
+    /// resolved once from the upstream's `GetCapabilities` response and
+    /// `max_batch_size_config_override`. See `resolved_max_batch_size`.
+    discovered_max_batch_size: OnceCell<usize>,
 }
 
 impl GrpcStore {
@@ -184,6 +195,8 @@ impl GrpcStore {
                 .iter()
                 .map(|s| s.to_lowercase())
                 .collect(),
+            max_batch_size_config_override: spec.max_batch_size_bytes,
+            discovered_max_batch_size: OnceCell::new(),
         }))
     }
 
@@ -304,6 +317,83 @@ impl GrpcStore {
                 .err_tip(|| "in GrpcStore::batch_read_blobs")
         })
         .await
+    }
+
+    /// Issues a `GetCapabilities` RPC to the upstream for this store's
+    /// instance.
+    async fn get_capabilities(&self) -> Result<ServerCapabilities, Error> {
+        let instance_name = self.instance_name.clone();
+        self.perform_request(instance_name, |instance_name| async move {
+            let channel = self
+                .connection_manager
+                .connection("get_capabilities".into())
+                .await
+                .err_tip(|| "in get_capabilities")?;
+            Ok(CapabilitiesClient::new(channel)
+                .get_capabilities(enrich_request(
+                    Request::new(GetCapabilitiesRequest { instance_name }),
+                    &self.headers,
+                    &self.forward_headers,
+                ))
+                .await
+                .err_tip(|| "in GrpcStore::get_capabilities")?
+                .into_inner())
+        })
+        .await
+    }
+
+    /// Resolves, once and then caches, the effective maximum total blob size
+    /// (bytes) for a single `BatchReadBlobs` request.
+    ///
+    /// The value is derived from the upstream's advertised
+    /// `cache_capabilities.max_batch_total_size_bytes`:
+    ///
+    /// - A discovered value of `0` means the upstream sets no limit; it is
+    ///   clamped to `BATCH_SIZE_FALLBACK_BYTES` because the gRPC message
+    ///   size limit still applies regardless.
+    /// - If the operator set `max_batch_size_config_override` (non-zero) the
+    ///   effective limit is the smaller of the two: config can lower the
+    ///   limit but never raise it above what the upstream permits.
+    /// - If the `GetCapabilities` RPC fails (e.g. an upstream that does not
+    ///   implement the Capabilities service) the fallback is used and a
+    ///   warning is logged. Discovery failure is not fatal.
+    async fn resolved_max_batch_size(&self) -> usize {
+        /// Conservative default when discovery yields no usable value. 4MB
+        /// is the de-facto REAPI standard and is gRPC-message-size safe.
+        const BATCH_SIZE_FALLBACK_BYTES: usize = 4 * 1024 * 1024;
+
+        *self
+            .discovered_max_batch_size
+            .get_or_init(|| async {
+                let discovered = match self.get_capabilities().await {
+                    Ok(caps) => caps
+                        .cache_capabilities
+                        .map_or(0, |c| c.max_batch_total_size_bytes),
+                    Err(e) => {
+                        warn!(
+                            ?e,
+                            "GrpcStore could not discover upstream BatchReadBlobs \
+                             capabilities; falling back to {BATCH_SIZE_FALLBACK_BYTES} bytes"
+                        );
+                        0
+                    }
+                };
+                // `0` from the upstream means "no limit"; the gRPC message
+                // size limit still applies, so clamp to the fallback.
+                let discovered: usize = if discovered <= 0 {
+                    BATCH_SIZE_FALLBACK_BYTES
+                } else {
+                    usize::try_from(discovered).unwrap_or(BATCH_SIZE_FALLBACK_BYTES)
+                };
+                if self.max_batch_size_config_override == 0 {
+                    discovered
+                } else {
+                    let override_bytes =
+                        usize::try_from(self.max_batch_size_config_override).unwrap_or(usize::MAX);
+                    discovered.min(override_bytes)
+                }
+            })
+            .await
     }
 
     pub async fn get_tree(
@@ -948,7 +1038,7 @@ impl StoreDriver for GrpcStore {
                 loop {
                     let data = match stream.next().await {
                         // Create an empty response to represent EOF.
-                        None => bytes::Bytes::new(),
+                        None => Bytes::new(),
                         Some(Ok(message)) => message.data,
                         Some(Err(status)) => {
                             return Some((
@@ -983,6 +1073,145 @@ impl StoreDriver for GrpcStore {
                 }
             }))
             .await
+    }
+
+    async fn get_many(
+        self: Pin<&Self>,
+        keys: &[StoreKey<'_>],
+    ) -> Result<Vec<Result<Option<Bytes>, Error>>, Error> {
+        /// Maximum number of digests in one `BatchReadBlobs` request,
+        /// independent of their total size. Keeps a single request's digest
+        /// list bounded even for many tiny blobs.
+        const MAX_BATCH_COUNT: usize = 1000;
+
+        if matches!(self.store_type, nativelink_config::stores::StoreType::Ac) {
+            return Err(make_err!(
+                Code::Internal,
+                "get_many (BatchReadBlobs) is a CAS operation, not valid on an AC store"
+            ));
+        }
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let digests: Vec<DigestInfo> = keys.iter().map(|k| k.borrow().into_digest()).collect();
+
+        // Results indexed positionally against `keys`. Zero-size blobs are
+        // satisfied inline with no RPC.
+        let mut results: Vec<Result<Option<Bytes>, Error>> =
+            digests.iter().map(|_| Ok(None)).collect();
+
+        // Map each unique non-zero digest to every input position that
+        // requested it, so a digest used by multiple keys (or a server that
+        // reorders responses) is reassembled correctly.
+        let mut digest_to_positions: HashMap<DigestInfo, Vec<usize>> = HashMap::new();
+        for (idx, digest) in digests.iter().enumerate() {
+            if digest.size_bytes() == 0 {
+                results[idx] = Ok(Some(Bytes::new()));
+            } else {
+                digest_to_positions.entry(*digest).or_default().push(idx);
+            }
+        }
+        if digest_to_positions.is_empty() {
+            return Ok(results);
+        }
+
+        let max_batch_size = self.resolved_max_batch_size().await;
+        let digest_function = Context::current()
+            .get::<DigestHasherFunc>()
+            .map_or_else(default_digest_hasher_func, |v| *v)
+            .proto_digest_func();
+
+        // Partition unique digests into batches bounded by both total size
+        // and count. A single digest larger than `max_batch_size` still gets
+        // its own batch on its own; callers that cannot tolerate that should
+        // route oversized blobs to the streaming `get_part` path instead.
+        let mut batches: Vec<Vec<DigestInfo>> = Vec::new();
+        let mut current: Vec<DigestInfo> = Vec::new();
+        let mut current_size: u64 = 0;
+        for digest in digest_to_positions.keys().copied() {
+            let size = digest.size_bytes();
+            let would_exceed_size =
+                !current.is_empty() && current_size.saturating_add(size) > max_batch_size as u64;
+            let would_exceed_count = current.len() >= MAX_BATCH_COUNT;
+            if would_exceed_size || would_exceed_count {
+                batches.push(core::mem::take(&mut current));
+                current_size = 0;
+            }
+            current.push(digest);
+            current_size = current_size.saturating_add(size);
+        }
+        if !current.is_empty() {
+            batches.push(current);
+        }
+
+        // Issue the BatchReadBlobs requests. Bounded concurrency keeps the
+        // number of simultaneous in-flight batch RPCs (and their buffered
+        // responses) finite.
+        const MAX_CONCURRENT_BATCHES: usize = 8;
+        let batch_responses: Vec<Result<BatchReadBlobsResponse, Error>> =
+            futures::stream::iter(batches.into_iter().map(|batch| async move {
+                let request = BatchReadBlobsRequest {
+                    instance_name: self.instance_name.clone(),
+                    digests: batch.into_iter().map(Into::into).collect(),
+                    // Always request IDENTITY: the batch size accounting
+                    // above is in terms of uncompressed bytes, and we do
+                    // not decompress in this path.
+                    acceptable_compressors: Vec::new(),
+                    digest_function: digest_function.into(),
+                };
+                self.batch_read_blobs(Request::new(request))
+                    .await
+                    .map(Response::into_inner)
+            }))
+            .buffer_unordered(MAX_CONCURRENT_BATCHES)
+            .collect()
+            .await;
+
+        for batch_response in batch_responses {
+            // A transport-level failure of one batch fails the whole call:
+            // the blobs in that batch have no per-blob status to report.
+            let batch_response = batch_response.err_tip(|| "In GrpcStore::get_many")?;
+            for blob in batch_response.responses {
+                let digest = DigestInfo::try_from(
+                    blob.digest
+                        .err_tip(|| "BatchReadBlobs response entry missing digest")?,
+                )?;
+                let Some(positions) = digest_to_positions.get(&digest) else {
+                    // Server returned a digest we did not ask for; ignore it.
+                    continue;
+                };
+                // We always request IDENTITY and do not decompress here; a
+                // compressed response would silently materialize corrupt
+                // data, so reject it loudly.
+                if blob.compressor != i32::from(compressor::Value::Identity) {
+                    return Err(make_err!(
+                        Code::Internal,
+                        "BatchReadBlobs returned non-IDENTITY compressor {} for digest {digest}",
+                        blob.compressor
+                    ));
+                }
+                // `status` absent or OK means success; otherwise it carries
+                // a per-blob error (commonly NotFound).
+                let status_code = blob.status.as_ref().map_or(0, |s| s.code);
+                let value: Result<Option<Bytes>, Error> = if status_code == 0 {
+                    Ok(Some(blob.data))
+                } else if status_code == i32::from(Code::NotFound) {
+                    Ok(None)
+                } else {
+                    Err(make_err!(
+                        Code::from_i32(status_code),
+                        "BatchReadBlobs per-blob failure for digest {digest}"
+                    ))
+                };
+                // Assign to every position that requested this digest.
+                // `Error`/`Bytes` clone cheaply (refcount / Arc).
+                for &pos in positions {
+                    results[pos] = value.clone();
+                }
+            }
+        }
+        Ok(results)
     }
 
     fn inner_store(&self, _digest: Option<StoreKey>) -> &dyn StoreDriver {
