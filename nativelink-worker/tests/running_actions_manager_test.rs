@@ -565,8 +565,6 @@ mod tests {
     #[nativelink_test]
     async fn download_to_directory_deeply_nested_tree_test()
     -> Result<(), Box<dyn core::error::Error>> {
-        let (fast_store, slow_store, cas_store, _ac_store) = setup_stores().await?;
-
         // Tree shape:
         //   root/
         //     root_file.txt
@@ -578,6 +576,8 @@ mod tests {
         const ROOT_FILE_CONTENT: &str = "ROOTFILE";
         const LEVEL1_FILE_CONTENT: &str = "LEVEL1FILE";
         const LEVEL2_FILE_CONTENT: &str = "LEVEL2FILE";
+
+        let (fast_store, slow_store, cas_store, _ac_store) = setup_stores().await?;
 
         let root_directory_digest = {
             let root_file_digest = DigestInfo::new([10u8; 32], 8);
@@ -693,6 +693,113 @@ mod tests {
                 .await
                 .err_tip(|| "On level2_symlink read")?;
             assert_eq!(from_utf8(&symlink_content)?, LEVEL2_FILE_CONTENT);
+        }
+        Ok(())
+    }
+
+    // Exercises the batched metadata stage of download_to_directory: more
+    // files than DOWNLOAD_TO_DIRECTORY_METADATA_BATCH_SIZE (64), each with a
+    // distinct mtime and unix_mode. The set_permissions/set_mtime syscalls are
+    // applied in batched spawn_blocking tasks; this verifies every file in
+    // every batch (including a final partial batch) ends up with the exact
+    // mode and mtime it was assigned.
+    #[cfg(not(target_family = "windows"))]
+    #[nativelink_test]
+    async fn download_to_directory_batched_metadata_test() -> Result<(), Box<dyn core::error::Error>>
+    {
+        // 150 files spans multiple 64-file metadata batches plus a partial.
+        const NUM_FILES: usize = 150;
+
+        let (fast_store, slow_store, cas_store, _ac_store) = setup_stores().await?;
+
+        // Per-file expected (mode, mtime_secs). Each file gets a distinct
+        // mode and mtime so a batch that applied the wrong file's metadata
+        // would be caught.
+        let mut expected: Vec<(u32, u64)> = Vec::with_capacity(NUM_FILES);
+
+        let root_directory_digest = {
+            let mut file_nodes = Vec::with_capacity(NUM_FILES);
+            for i in 0..NUM_FILES {
+                // NUM_FILES is small enough to fit in a u8 index.
+                let i_u8 = u8::try_from(i).unwrap();
+                let content = format!("file-content-{i}");
+                // Distinct content => distinct digest per file.
+                let mut hash = [0u8; 32];
+                hash[0] = i_u8;
+                let content_digest = DigestInfo::new(hash, content.len() as u64);
+                slow_store
+                    .as_ref()
+                    .update_oneshot(content_digest, content.clone().into())
+                    .await?;
+
+                // Modes cycle through a few rwx combinations; mtimes are
+                // distinct per file.
+                let mode = 0o600 | ((u32::from(i_u8) % 3) * 0o010);
+                let mtime_secs = 1_000 + i as u64;
+                expected.push((mode, mtime_secs));
+
+                file_nodes.push(FileNode {
+                    name: format!("file_{i}.txt"),
+                    digest: Some(content_digest.into()),
+                    is_executable: false,
+                    node_properties: Some(NodeProperties {
+                        properties: vec![],
+                        mtime: Some(
+                            SystemTime::UNIX_EPOCH
+                                .checked_add(Duration::from_secs(mtime_secs))
+                                .unwrap()
+                                .into(),
+                        ),
+                        unix_mode: Some(mode),
+                    }),
+                });
+            }
+
+            let root_directory_digest = DigestInfo::new([0xabu8; 32], 32);
+            let root_directory = Directory {
+                files: file_nodes,
+                ..Default::default()
+            };
+            slow_store
+                .as_ref()
+                .update_oneshot(root_directory_digest, root_directory.encode_to_vec().into())
+                .await?;
+            root_directory_digest
+        };
+
+        let download_dir = {
+            let download_dir = make_temp_path("download_dir");
+            fs::create_dir_all(&download_dir)
+                .await
+                .err_tip(|| format!("Could not make download_dir : {download_dir}"))?;
+            download_to_directory(
+                cas_store.as_ref(),
+                fast_store.as_pin(),
+                &root_directory_digest,
+                &download_dir,
+            )
+            .await?;
+            download_dir
+        };
+
+        for (i, (mode, mtime_secs)) in expected.into_iter().enumerate() {
+            let path = format!("{download_dir}/file_{i}.txt");
+            let metadata = fs::metadata(&path)
+                .await
+                .err_tip(|| format!("On metadata for {path}"))?;
+            assert_eq!(
+                metadata.mode() & 0o777,
+                mode,
+                "Wrong unix mode for file_{i}"
+            );
+            assert_eq!(
+                metadata
+                    .modified()?
+                    .duration_since(SystemTime::UNIX_EPOCH)?
+                    .as_secs(),
+                mtime_secs,
+                "Wrong mtime for file_{i}"
+            );
         }
         Ok(())
     }

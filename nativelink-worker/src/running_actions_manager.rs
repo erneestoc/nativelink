@@ -166,14 +166,25 @@ fn persistent_worker_request_arguments(argv: &[String]) -> Vec<String> {
 /// is metadata-bound (contends on APFS's per-volume lock on macOS).
 const DOWNLOAD_TO_DIRECTORY_FETCH_CONCURRENCY: usize = 128;
 
-/// Maximum number of concurrent `hardlink(2)` (plus `chmod`/`set_mtime`)
-/// futures in flight at one directory level.
+/// Maximum number of concurrent `hardlink(2)` futures in flight at one
+/// directory level.
 ///
 /// 64 is well above the inflection point on Linux filesystems but below the
 /// point at which APFS metadata contention on macOS dominates throughput.
 /// Composes with `DOWNLOAD_TO_DIRECTORY_FETCH_CONCURRENCY`: fetch and
 /// hardlink phases overlap, each with its own bound.
 const DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY: usize = 64;
+
+/// Number of materialized files whose `set_permissions` / `set_mtime`
+/// syscalls are applied inside a single `spawn_blocking` task.
+///
+/// Previously each file dispatched its own blocking task for
+/// `set_permissions` and another for `set_mtime`. Grouping a batch of files
+/// into one blocking task amortizes the per-task scheduling cost over the
+/// whole batch. The batch is filled by `try_ready_chunks` from the stream of
+/// completed hardlinks, so a partially-filled batch is still flushed as soon
+/// as the hardlink stream stalls or ends.
+const DOWNLOAD_TO_DIRECTORY_METADATA_BATCH_SIZE: usize = 64;
 
 /// Maximum number of concurrent `Directory` proto fetches in flight while
 /// walking the input tree breadth-first.
@@ -395,7 +406,7 @@ pub fn download_to_directory<'a>(
         // Channel: fetcher -> hardlinker. `usize` is the file index in
         // `files_arc`. Capacity is 2x the hardlink concurrency so the
         // fetcher can keep the hardlinker fed without unbounded buffering.
-        let (tx, mut rx) = mpsc::channel::<usize>(DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY * 2);
+        let (tx, rx) = mpsc::channel::<usize>(DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY * 2);
 
         // ---- Fetcher future ----
         // Launches all populate_fast_store calls upfront, capped at
@@ -459,108 +470,144 @@ pub fn download_to_directory<'a>(
         };
 
         // ---- Hardlinker future ----
-        // Drains the channel and performs hardlink + chmod + set_mtime,
-        // bounded at DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY in flight.
+        // Two stages over the stream of file indices coming from the fetcher:
+        //
+        //   A. Hardlink stage: at most DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY
+        //      hardlink (or zero-digest file create) operations in flight. Each
+        //      completed file yields its index downstream.
+        //   B. Metadata stage: `try_ready_chunks` groups completed hardlinks
+        //      into batches of up to DOWNLOAD_TO_DIRECTORY_METADATA_BATCH_SIZE,
+        //      and each batch's `set_permissions` / `set_mtime` syscalls run
+        //      inside a single `spawn_blocking` task instead of one task per
+        //      file. A partially-filled batch is flushed as soon as the
+        //      hardlink stream has nothing immediately ready.
         let hardlinker_fut = {
             let files_arc = files_arc.clone();
             async move {
-                let stream = futures::stream::unfold(&mut rx, |rx| async move {
+                let stream = futures::stream::unfold(rx, |mut rx| async move {
                     rx.recv().await.map(|idx| (Ok::<usize, Error>(idx), rx))
                 });
-                stream
-                    .try_for_each_concurrent(
-                        DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY,
-                        |idx| {
-                            let files_arc = files_arc.clone();
-                            async move {
-                                let file = &files_arc[idx];
-                                let dest = file.dest.clone();
-                                let file_digest = file.digest;
-                                if is_zero_digest(file_digest) {
-                                    // Zero-digest files are never persisted by
-                                    // the FilesystemStore, so materialise them
-                                    // directly in the worker exec dir. Attach
-                                    // context so a failure here is diagnosable
-                                    // as a missing empty file rather than a
-                                    // generic IO error.
-                                    let mut file_slot = fs::create_file(&dest)
-                                        .await
-                                        .err_tip(|| {
-                                            format!("Could not create zero-digest file at {dest}")
-                                        })?;
-                                    file_slot.write_all(&[]).await.err_tip(|| {
-                                        format!("Could not write zero-digest file at {dest}")
+                // Stage A: hardlink each file, bounded concurrency.
+                let hardlinked = stream
+                    .map_ok(|idx| {
+                        let files_arc = files_arc.clone();
+                        async move {
+                            let file = &files_arc[idx];
+                            let dest = file.dest.clone();
+                            let file_digest = file.digest;
+                            if is_zero_digest(file_digest) {
+                                // Zero-digest files are never persisted by
+                                // the FilesystemStore, so materialise them
+                                // directly in the worker exec dir. Attach
+                                // context so a failure here is diagnosable
+                                // as a missing empty file rather than a
+                                // generic IO error.
+                                let mut file_slot =
+                                    fs::create_file(&dest).await.err_tip(|| {
+                                        format!("Could not create zero-digest file at {dest}")
                                     })?;
-                                } else {
-                                    let file_entry = filesystem_store
-                                        .get_file_entry_for_digest(&file_digest)
-                                        .await
-                                        .err_tip(|| "During hard link")?;
-                                    // TODO: add a test for #2051: deadlock with large number of files
-                                    let src_path = file_entry
-                                        .get_file_path_locked(|src| async move {
-                                            Ok(PathBuf::from(src))
-                                        })
-                                        .await?;
-                                    fs::hard_link(&src_path, &dest).await.map_err(|e| {
-                                        if e.code == Code::NotFound {
-                                            e.append(format!(
-                                                "Could not make hardlink to {dest}, file was likely evicted from cache.\n\
-                                                This error often occurs when the filesystem store's max_bytes is too small for your workload.\n\
-                                                To fix this issue:\n\
-                                                1. Increase the 'max_bytes' value in your filesystem store configuration\n\
-                                                2. Example: Change 'max_bytes: 10000000000' to 'max_bytes: 50000000000' (or higher)\n\
-                                                3. The setting is typically found in your nativelink.json config under:\n\
-                                                stores -> [your_filesystem_store] -> filesystem -> eviction_policy -> max_bytes\n\
-                                                4. Restart NativeLink after making the change\n\n\
-                                                If this error persists after increasing max_bytes several times, please report at:\n\
-                                                https://github.com/TraceMachina/nativelink/issues\n\
-                                                Include your config file and both server and client logs to help us assist you."
-                                            ))
-                                        } else {
-                                            e.append(format!("Could not make hardlink to {dest}"))
-                                        }
-                                    })?;
-                                }
-                                #[cfg(target_family = "unix")]
-                                if let Some(unix_mode) = file.unix_mode {
-                                    fs::set_permissions(&dest, Permissions::from_mode(unix_mode))
-                                        .await
-                                        .err_tip(|| {
-                                            format!(
-                                                "Could not set unix mode in download_to_directory {dest}"
+                                file_slot.write_all(&[]).await.err_tip(|| {
+                                    format!("Could not write zero-digest file at {dest}")
+                                })?;
+                            } else {
+                                let file_entry = filesystem_store
+                                    .get_file_entry_for_digest(&file_digest)
+                                    .await
+                                    .err_tip(|| "During hard link")?;
+                                // TODO: add a test for #2051: deadlock with large number of files
+                                let src_path = file_entry
+                                    .get_file_path_locked(|src| async move {
+                                        Ok(PathBuf::from(src))
+                                    })
+                                    .await?;
+                                fs::hard_link(&src_path, &dest).await.map_err(|e| {
+                                    if e.code == Code::NotFound {
+                                        e.append(format!(
+                                            "Could not make hardlink to {dest}, file was likely evicted from cache.\n\
+                                            This error often occurs when the filesystem store's max_bytes is too small for your workload.\n\
+                                            To fix this issue:\n\
+                                            1. Increase the 'max_bytes' value in your filesystem store configuration\n\
+                                            2. Example: Change 'max_bytes: 10000000000' to 'max_bytes: 50000000000' (or higher)\n\
+                                            3. The setting is typically found in your nativelink.json config under:\n\
+                                            stores -> [your_filesystem_store] -> filesystem -> eviction_policy -> max_bytes\n\
+                                            4. Restart NativeLink after making the change\n\n\
+                                            If this error persists after increasing max_bytes several times, please report at:\n\
+                                            https://github.com/TraceMachina/nativelink/issues\n\
+                                            Include your config file and both server and client logs to help us assist you."
+                                        ))
+                                    } else {
+                                        e.append(format!("Could not make hardlink to {dest}"))
+                                    }
+                                })?;
+                            }
+                            Ok::<usize, Error>(idx)
+                        }
+                    })
+                    .try_buffer_unordered(DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY);
+
+                // Stage B: batch the metadata syscalls. `try_ready_chunks`
+                // surfaces a hardlink-stage error as `TryReadyChunksError`,
+                // whose `.1` is the underlying `Error`; the already-collected
+                // indices in `.0` are dropped because the whole
+                // download_to_directory is aborting and its work directory
+                // will be discarded by the caller.
+                hardlinked
+                    .try_ready_chunks(DOWNLOAD_TO_DIRECTORY_METADATA_BATCH_SIZE)
+                    .map_err(|e| e.1)
+                    .try_for_each(|chunk| {
+                        let files_arc = files_arc.clone();
+                        async move {
+                            // One blocking task for the whole batch: every
+                            // file's set_permissions + set_mtime runs here,
+                            // instead of two blocking tasks per file. These
+                            // are path-based metadata syscalls that hold no
+                            // file descriptor open, matching how the previous
+                            // per-file set_mtime was dispatched.
+                            spawn_blocking!(
+                                "download_to_directory_set_metadata",
+                                move || {
+                                    for &idx in &chunk {
+                                        let file = &files_arc[idx];
+                                        let dest = file.dest.as_str();
+                                        #[cfg(target_family = "unix")]
+                                        if let Some(unix_mode) = file.unix_mode {
+                                            std::fs::set_permissions(
+                                                dest,
+                                                Permissions::from_mode(unix_mode),
                                             )
-                                        })?;
-                                }
-                                if let Some((mtime_seconds, mtime_nanos_i32)) = file.mtime {
-                                    let mtime_nanos = mtime_nanos_i32 as u32;
-                                    let dest_for_mtime = dest.clone();
-                                    spawn_blocking!(
-                                        "download_to_directory_set_mtime",
-                                        move || {
+                                            .err_tip(|| {
+                                                format!(
+                                                    "Could not set unix mode in download_to_directory {dest}"
+                                                )
+                                            })?;
+                                        }
+                                        if let Some((mtime_seconds, mtime_nanos_i32)) =
+                                            file.mtime
+                                        {
                                             set_file_mtime(
-                                                &dest_for_mtime,
+                                                dest,
                                                 FileTime::from_unix_time(
                                                     mtime_seconds,
-                                                    mtime_nanos,
+                                                    mtime_nanos_i32 as u32,
                                                 ),
                                             )
                                             .err_tip(|| {
                                                 format!(
-                                                    "Failed to set mtime in download_to_directory {dest_for_mtime}"
+                                                    "Failed to set mtime in download_to_directory {dest}"
                                                 )
-                                            })
+                                            })?;
                                         }
-                                    )
-                                    .await
-                                    .err_tip(
-                                        || "Failed to launch spawn_blocking in download_to_directory",
-                                    )??;
+                                    }
+                                    Ok::<(), Error>(())
                                 }
-                                Ok::<(), Error>(())
-                            }
-                        },
-                    )
+                            )
+                            .await
+                            .err_tip(
+                                || "Failed to launch spawn_blocking in download_to_directory",
+                            )??;
+                            Ok::<(), Error>(())
+                        }
+                    })
                     .await
             }
         };
