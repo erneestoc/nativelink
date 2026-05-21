@@ -378,10 +378,17 @@ pub fn download_to_directory<'a>(
     current_directory: &'a str,
 ) -> BoxFuture<'a, Result<(), Error>> {
     async move {
+        // TEMPORARY INSTRUMENTATION (branch ec/pr2243-materialize-timing):
+        // per-phase wall-clock timing for diagnosing where input
+        // materialization spends its time. Not for merge.
+        let download_started_at = Instant::now();
+
         // ---- Phase 1: breadth-first directory-tree walk ----
         // Fetches every Directory proto level-by-level, creates all
         // subdirectories, and flattens every file (and symlink) in the tree.
+        let tree_walk_started_at = Instant::now();
         let collected = collect_directory_tree(cas_store, digest, current_directory).await?;
+        let tree_walk_elapsed = tree_walk_started_at.elapsed();
         let files_to_materialize = collected.files;
         #[cfg(target_family = "unix")]
         let symlinks_to_materialize = collected.symlinks;
@@ -399,6 +406,14 @@ pub fn download_to_directory<'a>(
                 .push(idx);
         }
         let unique_digests: Vec<DigestInfo> = digest_to_file_indices.keys().copied().collect();
+
+        // TEMPORARY INSTRUMENTATION: counts for the summary log below.
+        let total_file_count = files_to_materialize.len();
+        let unique_digest_count = unique_digests.len();
+        #[cfg(target_family = "unix")]
+        let symlink_count = symlinks_to_materialize.len();
+        #[cfg(not(target_family = "unix"))]
+        let symlink_count = 0usize;
 
         let files_arc = Arc::new(files_to_materialize);
         let digest_to_file_indices_arc = Arc::new(digest_to_file_indices);
@@ -640,7 +655,27 @@ pub fn download_to_directory<'a>(
         // hardlinker's recv() returns None.
         drop(tx);
 
+        // TEMPORARY INSTRUMENTATION: phase 2 = concurrent fetch + hardlink +
+        // batched metadata + symlink creation (all under one try_join3).
+        let fetch_and_hardlink_started_at = Instant::now();
         try_join3(fetcher_fut, hardlinker_fut, symlinks_fut).await?;
+        let fetch_and_hardlink_elapsed = fetch_and_hardlink_started_at.elapsed();
+
+        // TEMPORARY INSTRUMENTATION: one summary line per download_to_directory
+        // call. `tree_walk` = fetching/decoding Directory protos + creating
+        // dirs; `fetch_and_hardlink` = pulling blobs into the fast store,
+        // hardlinking them into place, chmod/mtime, and symlinks.
+        info!(
+            target: "download_to_directory_timing",
+            work_directory = current_directory,
+            total_files = total_file_count,
+            unique_blobs = unique_digest_count,
+            symlinks = symlink_count,
+            tree_walk_ms = tree_walk_elapsed.as_millis() as u64,
+            fetch_and_hardlink_ms = fetch_and_hardlink_elapsed.as_millis() as u64,
+            total_ms = download_started_at.elapsed().as_millis() as u64,
+            "download_to_directory phase timing",
+        );
         Ok(())
     }
     .boxed()
