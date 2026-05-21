@@ -353,3 +353,53 @@ async fn list_test() -> Result<(), Error> {
 
     Ok(())
 }
+
+// Exercises the default `StoreDriver::get_many` implementation: a mix of
+// present and absent keys must yield one result per input key, in input
+// order, with present keys returning their bytes and absent keys `None`.
+#[nativelink_test]
+async fn get_many_returns_present_and_absent_in_order() -> Result<(), Error> {
+    let store = MemoryStore::new(&MemorySpec::default());
+
+    const VALUE1: &str = "first-blob";
+    const VALUE3: &str = "third-blob";
+    let digest1 = DigestInfo::try_new(VALID_HASH1, VALUE1.len() as u64)?;
+    let digest2 = DigestInfo::try_new(VALID_HASH2, 10)?; // never inserted
+    let digest3 = DigestInfo::try_new(VALID_HASH3, VALUE3.len() as u64)?;
+
+    store.update_oneshot(digest1, VALUE1.into()).await?;
+    store.update_oneshot(digest3, VALUE3.into()).await?;
+
+    // Order: present, absent, present - results must line up positionally.
+    let keys = [
+        StoreKey::from(digest1),
+        StoreKey::from(digest2),
+        StoreKey::from(digest3),
+    ];
+    let results = store.get_many(&keys).await?;
+    assert_eq!(results.len(), 3);
+
+    assert_eq!(
+        results[0].as_ref().expect("key0 read ok").as_deref(),
+        Some(VALUE1.as_bytes()),
+    );
+    assert_eq!(
+        results[1].as_ref().expect("key1 read ok").as_deref(),
+        None,
+        "absent blob must be Ok(None), not an error",
+    );
+    assert_eq!(
+        results[2].as_ref().expect("key2 read ok").as_deref(),
+        Some(VALUE3.as_bytes()),
+    );
+    Ok(())
+}
+
+// An empty key slice is a no-op and must not error.
+#[nativelink_test]
+async fn get_many_empty_is_ok() -> Result<(), Error> {
+    let store = MemoryStore::new(&MemorySpec::default());
+    let results = store.get_many(&[]).await?;
+    assert!(results.is_empty());
+    Ok(())
+}

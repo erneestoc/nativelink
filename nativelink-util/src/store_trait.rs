@@ -28,6 +28,7 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use futures::stream::{self, StreamExt};
 use futures::{Future, FutureExt, Stream, join, try_join};
 use nativelink_error::{Code, Error, ResultExt, error_if, make_err};
 use nativelink_metric::MetricsComponent;
@@ -594,6 +595,26 @@ pub trait StoreLike: Send + Sync + Sized + Unpin + 'static {
         self.as_store_driver_pin().get(key.into(), writer)
     }
 
+    /// Batched whole-blob read. Returns one entry per input key, in the same
+    /// order: `Ok(Some(bytes))` if present, `Ok(None)` if not found, `Err`
+    /// for a hard failure reading that key. A hard failure of the batch
+    /// itself (e.g. transport error) is the outer `Err`.
+    ///
+    /// Intended for many small blobs that each fit comfortably in memory;
+    /// large blobs should be streamed via [`Self::get_part`] instead.
+    #[inline]
+    fn get_many<'a>(
+        &'a self,
+        keys: &'a [StoreKey<'a>],
+    ) -> impl Future<Output = Result<Vec<Result<Option<Bytes>, Error>>, Error>> + Send + 'a {
+        async move {
+            if keys.is_empty() {
+                return Ok(Vec::new());
+            }
+            self.as_store_driver_pin().get_many(keys).await
+        }
+    }
+
     /// Utility that will return all the bytes at once instead of in a streaming manner.
     #[inline]
     fn get_part_unchunked<'a>(
@@ -740,6 +761,42 @@ pub trait StoreDriver:
         mut writer: DropCloserWriteHalf,
     ) -> Result<(), Error> {
         self.get_part(key, &mut writer, 0, None).await
+    }
+
+    /// See: [`StoreLike::get_many`] for details.
+    ///
+    /// The default implementation fans out to `get_part_unchunked` per key.
+    /// Stores backed by a protocol with a native multi-key read (e.g.
+    /// [`crate`]-external `GrpcStore` via REAPI `BatchReadBlobs`) should
+    /// override this to issue genuinely batched requests.
+    async fn get_many(
+        self: Pin<&Self>,
+        keys: &[StoreKey<'_>],
+    ) -> Result<Vec<Result<Option<Bytes>, Error>>, Error> {
+        // Bound the fan-out so a large `keys` slice does not open an
+        // unbounded number of concurrent reads against the backend.
+        const DEFAULT_GET_MANY_CONCURRENCY: usize = 32;
+        // Build the per-key futures explicitly (rather than via a closure
+        // passed to a stream combinator) to keep higher-ranked lifetime
+        // inference simple: each future is a concrete value here.
+        let mut futs = Vec::with_capacity(keys.len());
+        for key in keys {
+            let key = key.borrow();
+            futs.push(async move {
+                match self.get_part_unchunked(key, 0, None).await {
+                    Ok(data) => Ok(Some(data)),
+                    // NotFound is a per-key absence, not a batch failure -
+                    // surface it as `Ok(None)` so the caller can decide.
+                    Err(e) if e.code == Code::NotFound => Ok(None),
+                    Err(e) => Err(e),
+                }
+            });
+        }
+        let results = stream::iter(futs)
+            .buffered(DEFAULT_GET_MANY_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        Ok(results)
     }
 
     /// See: [`StoreLike::get_part_unchunked`] for details.
