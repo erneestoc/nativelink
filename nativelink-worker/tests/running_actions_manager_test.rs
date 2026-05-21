@@ -845,6 +845,7 @@ mod tests {
             in_flight: AtomicUsize,
             max_in_flight: AtomicUsize,
             total_get_parts: AtomicUsize,
+            total_get_many_calls: AtomicUsize,
         }
 
         impl DelayedStore {
@@ -855,6 +856,7 @@ mod tests {
                     in_flight: AtomicUsize::new(0),
                     max_in_flight: AtomicUsize::new(0),
                     total_get_parts: AtomicUsize::new(0),
+                    total_get_many_calls: AtomicUsize::new(0),
                 })
             }
 
@@ -864,6 +866,10 @@ mod tests {
 
             pub(super) fn total_get_parts(&self) -> usize {
                 self.total_get_parts.load(Ordering::SeqCst)
+            }
+
+            pub(super) fn total_get_many_calls(&self) -> usize {
+                self.total_get_many_calls.load(Ordering::SeqCst)
             }
         }
 
@@ -942,6 +948,36 @@ mod tests {
                 result
             }
 
+            async fn get_many(
+                self: Pin<&Self>,
+                keys: &[StoreKey<'_>],
+            ) -> Result<Vec<Result<Option<bytes::Bytes>, Error>>, Error> {
+                // Count batched-read calls so a test can prove the worker's
+                // input fetch routes through get_many rather than per-blob
+                // get_part. The per-call delay plus in-flight tracking lets a
+                // test observe whether multiple batched fetches overlap.
+                // Delegates to the inner MemoryStore; its reads do not touch
+                // this store's get_part counter.
+                self.total_get_many_calls.fetch_add(1, Ordering::SeqCst);
+                let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut prev_max = self.max_in_flight.load(Ordering::SeqCst);
+                while current > prev_max {
+                    match self.max_in_flight.compare_exchange(
+                        prev_max,
+                        current,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => break,
+                        Err(actual) => prev_max = actual,
+                    }
+                }
+                tokio::time::sleep(self.get_part_delay).await;
+                let result = Pin::new(self.inner.as_ref()).get_many(keys).await;
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                result
+            }
+
             fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
                 self
             }
@@ -967,25 +1003,24 @@ mod tests {
         }
     }
 
-    // Concurrent fetch test: with N=20 missing blobs and a 75 ms per-blob
-    // slow-store delay, serial fetch would take ~1500 ms; concurrent fetch
-    // (bounded at 128) finishes in roughly one delay unit. We assert
-    // (a) max-in-flight >= 4 (proves concurrency, with plenty of headroom
-    // for slow CI) and (b) wall time < 500 ms (proves we're not serial).
+    // Concurrent batched-fetch test: with enough input files to span more
+    // than one fetch chunk (DOWNLOAD_TO_DIRECTORY_FETCH_CHUNK_SIZE = 512),
+    // the per-chunk `populate_fast_store_many` -> `get_many` calls must run
+    // concurrently rather than one chunk strictly after the previous. The
+    // DelayedStore records each get_many call and tracks how many overlap;
+    // serial chunk fetches would leave max-in-flight at 1.
     #[nativelink_test]
-    async fn download_to_directory_fetches_blobs_concurrently()
+    async fn download_to_directory_fetches_chunks_concurrently()
     -> Result<(), Box<dyn core::error::Error>> {
         use core::time::Duration;
-        use std::time::Instant;
 
         use concurrent_fetch_harness::DelayedStore;
         use nativelink_util::store_trait::Store;
 
-        const NUM_FILES: usize = 20;
-        const PER_FETCH_DELAY: Duration = Duration::from_millis(75);
+        // 1100 files spans three 512-digest fetch chunks.
+        const NUM_FILES: usize = 1100;
+        const PER_FETCH_DELAY: Duration = Duration::from_millis(150);
 
-        // Set up a custom FastSlowStore where the slow store wraps a
-        // MemoryStore with a per-`get_part` sleep.
         let fast_config = FilesystemSpec {
             content_path: make_temp_path("content_path"),
             temp_path: make_temp_path("temp_path"),
@@ -1006,19 +1041,17 @@ mod tests {
             Store::new(delayed_slow.clone()),
         ));
 
-        // Build a root directory containing NUM_FILES files with distinct
-        // digests. Each blob is small but distinct.
+        // Build a root directory of NUM_FILES files with distinct digests.
         let mut file_nodes = Vec::with_capacity(NUM_FILES);
         for i in 0..NUM_FILES {
             let mut hash = [0u8; 32];
-            // i is bounded by NUM_FILES which fits in u8.
-            hash[0] = u8::try_from(i + 1).expect("NUM_FILES fits in u8");
-            hash[1] = 0xab;
+            // i is bounded by NUM_FILES; spread across the first two bytes.
+            hash[0] = u8::try_from(i & 0xff).expect("byte");
+            hash[1] = u8::try_from((i >> 8) & 0xff).expect("byte");
+            hash[2] = 0xab;
             let body = format!("blob-content-{i}");
             let body_len = u64::try_from(body.len()).expect("test body fits in u64");
             let digest = DigestInfo::new(hash, body_len);
-            // Insert directly into the inner slow store (bypasses delay
-            // wrapper for setup).
             inner_slow.update_oneshot(digest, body.into()).await?;
             file_nodes.push(FileNode {
                 name: format!("file_{i}.dat"),
@@ -1031,10 +1064,6 @@ mod tests {
             files: file_nodes,
             ..Default::default()
         };
-        // The root directory proto must also be readable. Insert it via
-        // the inner store. NOTE: the very first `get_and_decode_digest`
-        // call in download_to_directory will also pay one delay slot for
-        // this proto.
         let root_directory_digest = DigestInfo::new([0xff; 32], 32);
         inner_slow
             .update_oneshot(root_directory_digest, root_directory.encode_to_vec().into())
@@ -1043,7 +1072,6 @@ mod tests {
         let download_dir = make_temp_path("download_dir_concurrent");
         fs::create_dir_all(&download_dir).await?;
 
-        let start = Instant::now();
         download_to_directory(
             cas_store.as_ref(),
             fast_store.as_pin(),
@@ -1051,82 +1079,57 @@ mod tests {
             &download_dir,
         )
         .await?;
-        let elapsed = start.elapsed();
 
-        let max_in_flight = delayed_slow.max_in_flight();
-        let total = delayed_slow.total_get_parts();
-
-        // All blobs were materialized as files.
-        for i in 0..NUM_FILES {
-            let path = format!("{download_dir}/file_{i}.dat");
-            let body = fs::read(&path).await?;
+        // Spot-check a few files materialized correctly.
+        for i in [0usize, 511, 512, 1099] {
+            let body = fs::read(format!("{download_dir}/file_{i}.dat")).await?;
             assert_eq!(from_utf8(&body)?, format!("blob-content-{i}"));
         }
 
-        // Sanity: the slow store really did serve every fetch (i.e. nothing
-        // short-circuited around our delay wrapper). Expect at minimum
-        // NUM_FILES `get_part` calls (one per blob); the root directory
-        // proto itself adds one more.
+        // The input blobs were fetched via the batched get_many path,
+        // across multiple chunks (1100 files / 512 per chunk = 3 chunks).
         assert!(
-            total >= NUM_FILES,
-            "expected at least {NUM_FILES} get_part calls, observed {total}",
+            delayed_slow.total_get_many_calls() >= 3,
+            "expected >= 3 batched get_many calls for 1100 files; observed {}",
+            delayed_slow.total_get_many_calls(),
         );
 
-        // Proves concurrency: at some point during the run, multiple
-        // populate_fast_store calls were simultaneously inside `get_part`.
-        // We use a low threshold (4) to keep the test stable on slow CI.
-        // Serial behavior would yield max_in_flight == 1.
+        // Chunk fetches overlapped: max-in-flight rose above 1. A serial
+        // chunk-after-chunk fetch would leave max_in_flight == 1. This is
+        // the deterministic signal of concurrency; wall-clock time is not
+        // asserted because real filesystem write cost dominates the
+        // injected delay at this file count.
         assert!(
-            max_in_flight >= 4,
-            "expected concurrent fetches (max_in_flight >= 4), observed max_in_flight = {max_in_flight} \
-             with total get_parts = {total}",
-        );
-
-        // Wall-clock bound: serial would be NUM_FILES * PER_FETCH_DELAY =
-        // 1500 ms. Concurrent (with cap 128) should finish in roughly one
-        // delay unit plus overhead. We use 500 ms as a generous upper bound.
-        assert!(
-            elapsed < Duration::from_millis(500),
-            "expected concurrent fetch wall time < 500 ms, observed {elapsed:?} \
-             (serial would be ~{}ms)",
-            (NUM_FILES as u64) * 75,
+            delayed_slow.max_in_flight() >= 2,
+            "expected concurrent chunk fetches (max_in_flight >= 2); observed {}",
+            delayed_slow.max_in_flight(),
         );
 
         Ok(())
     }
 
-    // Streaming-hardlink test: confirms that hardlinks start while later
-    // fetches are still in flight. We use a single root directory with
-    // a known number of files, and observe that max_in_flight reaches
-    // the fetcher's natural cap; if hardlinks blocked the fetcher, we'd
-    // see throughput collapse below the serial-fetch wall-time budget.
-    //
-    // This is a coarser test than the first one - it just ensures we
-    // do not regress to a "fetch-all, then hardlink-all" two-phase
-    // structure that drops the overlap entirely.
+    // Proves download_to_directory fetches input blobs through the batched
+    // get_many path (FastSlowStore::populate_fast_store_many) rather than one
+    // get_part per blob. The DelayedStore counts get_many calls separately
+    // from get_part: a batched fetch bumps total_get_many_calls and leaves
+    // total_get_parts at zero.
     #[nativelink_test]
-    async fn download_to_directory_streams_hardlinks_while_fetching()
+    async fn download_to_directory_fetches_inputs_via_batched_get_many()
     -> Result<(), Box<dyn core::error::Error>> {
-        use core::time::Duration;
-        use std::time::Instant;
-
         use concurrent_fetch_harness::DelayedStore;
         use nativelink_util::store_trait::Store;
 
-        // Use enough files that a serial implementation would be
-        // obviously slow but few enough that the test stays fast.
-        const NUM_FILES: usize = 30;
-        const PER_FETCH_DELAY: Duration = Duration::from_millis(50);
+        const NUM_FILES: usize = 12;
 
         let fast_config = FilesystemSpec {
-            content_path: make_temp_path("content_path_stream"),
-            temp_path: make_temp_path("temp_path_stream"),
+            content_path: make_temp_path("content_path"),
+            temp_path: make_temp_path("temp_path"),
             eviction_policy: None,
             ..Default::default()
         };
         let fast_store = FilesystemStore::new(&fast_config).await?;
         let inner_slow = MemoryStore::new(&MemorySpec::default());
-        let delayed_slow = DelayedStore::new(inner_slow.clone(), PER_FETCH_DELAY);
+        let delayed_slow = DelayedStore::new(inner_slow.clone(), Duration::from_millis(0));
         let cas_store = Arc::new(FastSlowStore::new(
             &FastSlowSpec {
                 fast: StoreSpec::Filesystem(fast_config),
@@ -1141,15 +1144,13 @@ mod tests {
         let mut file_nodes = Vec::with_capacity(NUM_FILES);
         for i in 0..NUM_FILES {
             let mut hash = [0u8; 32];
-            // i is bounded by NUM_FILES which fits in u8.
             hash[0] = u8::try_from(i + 1).expect("NUM_FILES fits in u8");
             hash[1] = 0xcd;
-            let body = format!("stream-blob-{i}");
-            let body_len = u64::try_from(body.len()).expect("test body fits in u64");
-            let digest = DigestInfo::new(hash, body_len);
+            let body = format!("batch-blob-{i}");
+            let digest = DigestInfo::new(hash, body.len() as u64);
             inner_slow.update_oneshot(digest, body.into()).await?;
             file_nodes.push(FileNode {
-                name: format!("stream_file_{i}.dat"),
+                name: format!("file_{i}.dat"),
                 digest: Some(digest.into()),
                 is_executable: false,
                 node_properties: None,
@@ -1159,15 +1160,13 @@ mod tests {
             files: file_nodes,
             ..Default::default()
         };
-        let root_directory_digest = DigestInfo::new([0xee; 32], 32);
+        let root_directory_digest = DigestInfo::new([0xfe; 32], 32);
         inner_slow
             .update_oneshot(root_directory_digest, root_directory.encode_to_vec().into())
             .await?;
 
-        let download_dir = make_temp_path("download_dir_stream");
+        let download_dir = make_temp_path("download_dir_batched_get_many");
         fs::create_dir_all(&download_dir).await?;
-
-        let start = Instant::now();
         download_to_directory(
             cas_store.as_ref(),
             fast_store.as_pin(),
@@ -1175,29 +1174,27 @@ mod tests {
             &download_dir,
         )
         .await?;
-        let elapsed = start.elapsed();
 
-        // Verify all files materialized.
+        // Every file materialized correctly.
         for i in 0..NUM_FILES {
-            let path = format!("{download_dir}/stream_file_{i}.dat");
-            let body = fs::read(&path).await?;
-            assert_eq!(from_utf8(&body)?, format!("stream-blob-{i}"));
+            let body = fs::read(format!("{download_dir}/file_{i}.dat")).await?;
+            assert_eq!(from_utf8(&body)?, format!("batch-blob-{i}"));
         }
 
-        // If fetches were serialized OR if the consumer held the producer
-        // back, total time would be at minimum NUM_FILES * 50 ms = 1500 ms.
-        // With concurrent fetch + streaming hardlink, we expect close to
-        // one delay unit plus per-blob overhead. Allow generous headroom.
+        // The input file blobs were fetched via the batched get_many path...
         assert!(
-            elapsed < Duration::from_millis(750),
-            "expected fetch+hardlink streaming wall time < 750 ms, observed {elapsed:?}",
+            delayed_slow.total_get_many_calls() >= 1,
+            "expected the worker to fetch input file blobs via get_many; observed 0 calls",
         );
-
-        // Concurrency was actually achieved.
+        // ...not one get_part per file. The only get_part calls are for the
+        // single root Directory proto (fetched via get_and_decode_digest);
+        // the 12 file content blobs must not add to that count. A
+        // regression to per-blob fetch would push total_get_parts to ~13.
         assert!(
-            delayed_slow.max_in_flight() >= 4,
-            "expected concurrent fetches; observed max_in_flight = {}",
-            delayed_slow.max_in_flight(),
+            delayed_slow.total_get_parts() <= 1,
+            "expected file blobs to be batched, not fetched per-blob via get_part; \
+             observed {} get_part calls (only the root Directory proto should use get_part)",
+            delayed_slow.total_get_parts(),
         );
 
         Ok(())

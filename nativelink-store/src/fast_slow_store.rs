@@ -475,11 +475,14 @@ impl FastSlowStore {
                 .err_tip(|| "Batched slow-store read in populate_fast_store_many")?;
             // Write each fetched blob into the fast store. Bounded
             // concurrency keeps the number of in-flight fast-store writes
-            // finite for a large batch.
+            // finite for a large batch. Futures are built in an explicit
+            // loop (not via a closure) to keep higher-ranked lifetime
+            // inference simple.
             const FAST_STORE_WRITE_CONCURRENCY: usize = 32;
-            let writes = small_keys.iter().zip(blobs).map(|(key, blob)| {
+            let mut writes = Vec::with_capacity(small_keys.len());
+            for (key, blob) in small_keys.iter().zip(blobs) {
                 let key = key.borrow();
-                async move {
+                writes.push(async move {
                     match blob {
                         Ok(Some(data)) => self
                             .fast_store
@@ -496,8 +499,8 @@ impl FastSlowStore {
                         )),
                         Err(e) => Err(e),
                     }
-                }
-            });
+                });
+            }
             stream::iter(writes)
                 .buffer_unordered(FAST_STORE_WRITE_CONCURRENCY)
                 .collect::<Vec<_>>()
@@ -510,10 +513,11 @@ impl FastSlowStore {
         // which composes with the get_loader de-duplication.
         if !large_keys.is_empty() {
             const LARGE_BLOB_FETCH_CONCURRENCY: usize = 16;
-            let fetches = large_keys.iter().map(|key| {
+            let mut fetches = Vec::with_capacity(large_keys.len());
+            for key in &large_keys {
                 let key = key.borrow();
-                async move { self.populate_fast_store(key.borrow()).await }
-            });
+                fetches.push(async move { self.populate_fast_store(key.borrow()).await });
+            }
             stream::iter(fetches)
                 .buffer_unordered(LARGE_BLOB_FETCH_CONCURRENCY)
                 .collect::<Vec<_>>()
