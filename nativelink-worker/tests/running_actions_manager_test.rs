@@ -553,6 +553,150 @@ mod tests {
         Ok(())
     }
 
+    // Exercises the breadth-first directory-tree walk: a tree several levels
+    // deep, with files at every level and a symlink nested two levels down.
+    // Verifies that (a) every Directory proto is fetched and decoded, (b)
+    // every subdirectory is created before the files inside it are
+    // materialized, and (c) deeply nested files/symlinks land at the right
+    // path. A regression to depth-recursion that skipped a level, or that
+    // materialized files before their parent directory existed, would fail
+    // this test.
+    #[cfg(not(target_family = "windows"))]
+    #[nativelink_test]
+    async fn download_to_directory_deeply_nested_tree_test()
+    -> Result<(), Box<dyn core::error::Error>> {
+        let (fast_store, slow_store, cas_store, _ac_store) = setup_stores().await?;
+
+        // Tree shape:
+        //   root/
+        //     root_file.txt
+        //     level1/
+        //       level1_file.txt
+        //       level2/
+        //         level2_file.txt
+        //         level2_symlink -> level2_file.txt
+        const ROOT_FILE_CONTENT: &str = "ROOTFILE";
+        const LEVEL1_FILE_CONTENT: &str = "LEVEL1FILE";
+        const LEVEL2_FILE_CONTENT: &str = "LEVEL2FILE";
+
+        let root_directory_digest = {
+            let root_file_digest = DigestInfo::new([10u8; 32], 8);
+            slow_store
+                .as_ref()
+                .update_oneshot(root_file_digest, ROOT_FILE_CONTENT.into())
+                .await?;
+            let level1_file_digest = DigestInfo::new([11u8; 32], 10);
+            slow_store
+                .as_ref()
+                .update_oneshot(level1_file_digest, LEVEL1_FILE_CONTENT.into())
+                .await?;
+            let level2_file_digest = DigestInfo::new([12u8; 32], 10);
+            slow_store
+                .as_ref()
+                .update_oneshot(level2_file_digest, LEVEL2_FILE_CONTENT.into())
+                .await?;
+
+            let level2_dir_digest = DigestInfo::new([13u8; 32], 32);
+            let level2_dir = Directory {
+                files: vec![FileNode {
+                    name: "level2_file.txt".to_string(),
+                    digest: Some(level2_file_digest.into()),
+                    ..Default::default()
+                }],
+                symlinks: vec![SymlinkNode {
+                    name: "level2_symlink".to_string(),
+                    target: "level2_file.txt".to_string(),
+                    node_properties: None,
+                }],
+                ..Default::default()
+            };
+            slow_store
+                .as_ref()
+                .update_oneshot(level2_dir_digest, level2_dir.encode_to_vec().into())
+                .await?;
+
+            let level1_dir_digest = DigestInfo::new([14u8; 32], 32);
+            let level1_dir = Directory {
+                files: vec![FileNode {
+                    name: "level1_file.txt".to_string(),
+                    digest: Some(level1_file_digest.into()),
+                    ..Default::default()
+                }],
+                directories: vec![DirectoryNode {
+                    name: "level2".to_string(),
+                    digest: Some(level2_dir_digest.into()),
+                }],
+                ..Default::default()
+            };
+            slow_store
+                .as_ref()
+                .update_oneshot(level1_dir_digest, level1_dir.encode_to_vec().into())
+                .await?;
+
+            let root_directory_digest = DigestInfo::new([15u8; 32], 32);
+            let root_directory = Directory {
+                files: vec![FileNode {
+                    name: "root_file.txt".to_string(),
+                    digest: Some(root_file_digest.into()),
+                    ..Default::default()
+                }],
+                directories: vec![DirectoryNode {
+                    name: "level1".to_string(),
+                    digest: Some(level1_dir_digest.into()),
+                }],
+                ..Default::default()
+            };
+            slow_store
+                .as_ref()
+                .update_oneshot(root_directory_digest, root_directory.encode_to_vec().into())
+                .await?;
+            root_directory_digest
+        };
+
+        let download_dir = {
+            let download_dir = make_temp_path("download_dir");
+            fs::create_dir_all(&download_dir)
+                .await
+                .err_tip(|| format!("Could not make download_dir : {download_dir}"))?;
+            download_to_directory(
+                cas_store.as_ref(),
+                fast_store.as_pin(),
+                &root_directory_digest,
+                &download_dir,
+            )
+            .await?;
+            download_dir
+        };
+
+        {
+            let root_file = fs::read(format!("{download_dir}/root_file.txt"))
+                .await
+                .err_tip(|| "On root_file read")?;
+            assert_eq!(from_utf8(&root_file)?, ROOT_FILE_CONTENT);
+
+            let level1_file = fs::read(format!("{download_dir}/level1/level1_file.txt"))
+                .await
+                .err_tip(|| "On level1_file read")?;
+            assert_eq!(from_utf8(&level1_file)?, LEVEL1_FILE_CONTENT);
+
+            let level2_file = fs::read(format!("{download_dir}/level1/level2/level2_file.txt"))
+                .await
+                .err_tip(|| "On level2_file read")?;
+            assert_eq!(from_utf8(&level2_file)?, LEVEL2_FILE_CONTENT);
+
+            let symlink_path = format!("{download_dir}/level1/level2/level2_symlink");
+            let symlink_metadata = fs::symlink_metadata(&symlink_path)
+                .await
+                .err_tip(|| "On level2_symlink symlink_metadata")?;
+            assert_eq!(symlink_metadata.is_symlink(), true);
+            let symlink_content = fs::read(&symlink_path)
+                .await
+                .err_tip(|| "On level2_symlink read")?;
+            assert_eq!(from_utf8(&symlink_content)?, LEVEL2_FILE_CONTENT);
+        }
+        Ok(())
+    }
+
     // ---- Helpers for concurrent-fetch tests ----
     //
     // A minimal store wrapper that delegates to an inner MemoryStore but

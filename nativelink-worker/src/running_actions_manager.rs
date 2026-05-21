@@ -175,6 +175,15 @@ const DOWNLOAD_TO_DIRECTORY_FETCH_CONCURRENCY: usize = 128;
 /// hardlink phases overlap, each with its own bound.
 const DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY: usize = 64;
 
+/// Maximum number of concurrent `Directory` proto fetches in flight while
+/// walking the input tree breadth-first.
+///
+/// The tree walk fetches every `Directory` proto for one tree level in a
+/// single concurrent batch before descending, so the proto round-trips are
+/// serialized by tree *depth* rather than by node count. This bound caps how
+/// many of a level's protos are read at once.
+const DOWNLOAD_TO_DIRECTORY_DIR_FETCH_CONCURRENCY: usize = 128;
+
 /// Per-file work item materialized by `download_to_directory`. Collected up
 /// front so the fetcher (concurrent blob fetch) and hardlinker (concurrent
 /// `hardlink(2)`+chmod+mtime) phases can be driven from the same index.
@@ -190,23 +199,159 @@ struct FileToMaterialize {
     unix_mode: Option<u32>,
 }
 
+/// A symlink discovered during the directory-tree walk, materialized after
+/// every directory in the tree exists.
+#[cfg(target_family = "unix")]
+struct SymlinkToMaterialize {
+    target: String,
+    dest: String,
+}
+
+/// Flattened contents of an input `Directory` tree, produced by
+/// `collect_directory_tree`. Every directory in the tree has already been
+/// created on disk by the time this is returned.
+struct CollectedTree {
+    /// Every regular file across the whole tree.
+    files: Vec<FileToMaterialize>,
+    /// Every symlink across the whole tree.
+    #[cfg(target_family = "unix")]
+    symlinks: Vec<SymlinkToMaterialize>,
+}
+
+/// Walks the input `Directory` tree breadth-first, fetching every `Directory`
+/// proto for one tree level in a single concurrent batch before descending to
+/// the next.
+///
+/// Side effects performed during the walk:
+///
+/// - `create_dir` for every subdirectory, in breadth-first order, so a parent
+///   directory always exists before any of its children are created.
+/// - Accumulates every regular file across the whole tree into
+///   `CollectedTree::files` and every symlink into `CollectedTree::symlinks`.
+///
+/// The caller is responsible for the root `current_directory` already
+/// existing; only discovered subdirectories are created here.
+async fn collect_directory_tree(
+    cas_store: &FastSlowStore,
+    root_digest: &DigestInfo,
+    root_directory: &str,
+) -> Result<CollectedTree, Error> {
+    let mut files_to_materialize: Vec<FileToMaterialize> = Vec::new();
+    #[cfg(target_family = "unix")]
+    let mut symlinks_to_materialize: Vec<SymlinkToMaterialize> = Vec::new();
+
+    // Each entry is (digest of the Directory proto, on-disk path of the
+    // directory the proto describes). The current level's entries are fetched
+    // concurrently; their child directories form the next level.
+    let mut current_level: Vec<(DigestInfo, String)> =
+        vec![(*root_digest, root_directory.to_string())];
+
+    while !current_level.is_empty() {
+        // Fetch and decode every Directory proto for this level concurrently.
+        // `buffer_unordered` keeps at most DIR_FETCH_CONCURRENCY round-trips
+        // in flight; ordering does not matter because each result carries its
+        // own on-disk path.
+        let level_protos: Vec<(ProtoDirectory, String)> =
+            futures::stream::iter(current_level.into_iter().map(
+                |(dir_digest, dir_path)| async move {
+                    let directory =
+                        get_and_decode_digest::<ProtoDirectory>(cas_store, dir_digest.into())
+                            .await
+                            .err_tip(|| format!("Converting digest to Directory for {dir_path}"))?;
+                    Ok::<_, Error>((directory, dir_path))
+                },
+            ))
+            .buffer_unordered(DOWNLOAD_TO_DIRECTORY_DIR_FETCH_CONCURRENCY)
+            .try_collect()
+            .await?;
+
+        let mut next_level: Vec<(DigestInfo, String)> = Vec::new();
+        for (directory, current_directory) in level_protos {
+            for file in directory.files {
+                let file_digest: DigestInfo = file
+                    .digest
+                    .err_tip(|| "Expected Digest to exist in Directory::file::digest")?
+                    .try_into()
+                    .err_tip(|| "In Directory::file::digest")?;
+                let dest = format!("{}/{}", current_directory, file.name);
+                let (mtime, mut unix_mode) = match file.node_properties {
+                    Some(properties) => (
+                        properties.mtime.map(|t| (t.seconds, t.nanos)),
+                        properties.unix_mode,
+                    ),
+                    None => (None, None),
+                };
+                #[cfg_attr(target_family = "windows", allow(unused_assignments))]
+                if file.is_executable {
+                    unix_mode = Some(unix_mode.unwrap_or(0o444) | 0o111);
+                }
+                files_to_materialize.push(FileToMaterialize {
+                    digest: file_digest,
+                    dest,
+                    mtime,
+                    #[cfg(target_family = "unix")]
+                    unix_mode,
+                });
+            }
+
+            for directory_node in directory.directories {
+                let directory_node_digest: DigestInfo = directory_node
+                    .digest
+                    .err_tip(|| "Expected Digest to exist in Directory::directories::digest")?
+                    .try_into()
+                    .err_tip(|| "In Directory::file::digest")?;
+                let new_directory_path = format!("{}/{}", current_directory, directory_node.name);
+                // Create the directory now: breadth-first order guarantees
+                // `current_directory` already exists, and creating every
+                // directory before the file-materialization phase means
+                // files can be hardlinked into them unconditionally.
+                fs::create_dir(&new_directory_path)
+                    .await
+                    .err_tip(|| format!("Could not create directory {new_directory_path}"))?;
+                next_level.push((directory_node_digest, new_directory_path));
+            }
+
+            #[cfg(target_family = "unix")]
+            for symlink_node in directory.symlinks {
+                symlinks_to_materialize.push(SymlinkToMaterialize {
+                    target: symlink_node.target,
+                    dest: format!("{}/{}", current_directory, symlink_node.name),
+                });
+            }
+        }
+        current_level = next_level;
+    }
+
+    Ok(CollectedTree {
+        files: files_to_materialize,
+        #[cfg(target_family = "unix")]
+        symlinks: symlinks_to_materialize,
+    })
+}
+
 /// Aggressively download the digests of files and make a local folder from it.
 ///
-/// Two-phase pipeline:
+/// Three-phase pipeline:
 ///
-/// 1. Fetcher: launches up to `DOWNLOAD_TO_DIRECTORY_FETCH_CONCURRENCY`
+/// 1. Tree walk: `collect_directory_tree` walks the input tree breadth-first,
+///    fetching every `Directory` proto for one tree level in a single
+///    concurrent batch. It creates all subdirectories and flattens every file
+///    and symlink in the tree into one list each. CAS round-trips for
+///    `Directory` protos are therefore serialized by tree depth, not by node
+///    count.
+///
+/// 2. Fetcher: launches up to `DOWNLOAD_TO_DIRECTORY_FETCH_CONCURRENCY`
 ///    `populate_fast_store` calls in flight, deduplicated per unique digest
-///    so the same blob is never fetched twice. As each blob lands, every file
-///    that needs it is forwarded to the channel.
+///    so the same blob is never fetched twice (the dedup is tree-wide). As
+///    each blob lands, every file that needs it is forwarded to the channel.
 ///
-/// 2. Hardlinker: consumes the channel, performing up to
+/// 3. Hardlinker: consumes the channel, performing up to
 ///    `DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY` `hardlink(2)` /
 ///    `set_permissions` / `set_mtime` ops in flight.
 ///
 /// Hardlinking begins as soon as the first blob arrives - it does not wait
-/// for all fetches to complete. Subdirectories recurse concurrently; symlinks
-/// run concurrently. Both share a single outer `try_join3` with the
-/// fetcher+hardlinker pipeline.
+/// for all fetches to complete. Symlinks run concurrently. Both share a
+/// single outer `try_join3` with the fetcher+hardlinker pipeline.
 ///
 /// We require the `FilesystemStore` to be the `fast` store of `FastSlowStore`. This is for
 /// efficiency reasons. We will request the `FastSlowStore` to populate the entry then we will
@@ -222,41 +367,13 @@ pub fn download_to_directory<'a>(
     current_directory: &'a str,
 ) -> BoxFuture<'a, Result<(), Error>> {
     async move {
-        let directory = get_and_decode_digest::<ProtoDirectory>(cas_store, digest.into())
-            .await
-            .err_tip(|| "Converting digest to Directory")?;
-
-        // ---- Collect files ----
-        // We collect into a Vec first so we can (a) dedupe digests for the
-        // fetcher and (b) drive the producer/consumer pipeline.
-        let mut files_to_materialize: Vec<FileToMaterialize> =
-            Vec::with_capacity(directory.files.len());
-        for file in directory.files {
-            let file_digest: DigestInfo = file
-                .digest
-                .err_tip(|| "Expected Digest to exist in Directory::file::digest")?
-                .try_into()
-                .err_tip(|| "In Directory::file::digest")?;
-            let dest = format!("{}/{}", current_directory, file.name);
-            let (mtime, mut unix_mode) = match file.node_properties {
-                Some(properties) => (
-                    properties.mtime.map(|t| (t.seconds, t.nanos)),
-                    properties.unix_mode,
-                ),
-                None => (None, None),
-            };
-            #[cfg_attr(target_family = "windows", allow(unused_assignments))]
-            if file.is_executable {
-                unix_mode = Some(unix_mode.unwrap_or(0o444) | 0o111);
-            }
-            files_to_materialize.push(FileToMaterialize {
-                digest: file_digest,
-                dest,
-                mtime,
-                #[cfg(target_family = "unix")]
-                unix_mode,
-            });
-        }
+        // ---- Phase 1: breadth-first directory-tree walk ----
+        // Fetches every Directory proto level-by-level, creates all
+        // subdirectories, and flattens every file (and symlink) in the tree.
+        let collected = collect_directory_tree(cas_store, digest, current_directory).await?;
+        let files_to_materialize = collected.files;
+        #[cfg(target_family = "unix")]
+        let symlinks_to_materialize = collected.symlinks;
 
         // ---- Build dedup index: digest -> indices of files that need it ----
         // The fetcher drains `unique_digests`; once a digest is fetched, every
@@ -448,56 +565,26 @@ pub fn download_to_directory<'a>(
             }
         };
 
-        // ---- Directory + symlink futures ----
-        // These run alongside the file fetcher/hardlinker. They're separate
-        // from the files pipeline because they don't fetch blobs; they're
-        // collected into a FuturesUnordered drained at the same time as
-        // the fetcher/hardlinker via try_join3.
-        let mut extras = FuturesUnordered::new();
-        for directory_node in directory.directories {
-            let directory_node_digest: DigestInfo = directory_node
-                .digest
-                .err_tip(|| "Expected Digest to exist in Directory::directories::digest")?
-                .try_into()
-                .err_tip(|| "In Directory::file::digest")?;
-            let new_directory_path = format!("{}/{}", current_directory, directory_node.name);
-            extras.push(
-                async move {
-                    fs::create_dir(&new_directory_path)
-                        .await
-                        .err_tip(|| format!("Could not create directory {new_directory_path}"))?;
-                    download_to_directory(
-                        cas_store,
-                        filesystem_store,
-                        &directory_node_digest,
-                        &new_directory_path,
-                    )
-                    .await
-                    .err_tip(|| format!("in download_to_directory : {new_directory_path}"))?;
-                    Ok::<(), Error>(())
+        // ---- Symlink future ----
+        // Every directory in the tree was already created during the
+        // breadth-first walk, so this only materializes symlinks. It runs
+        // alongside the file fetcher/hardlinker via try_join3.
+        let symlinks_fut = async move {
+            #[cfg(target_family = "unix")]
+            {
+                let mut symlink_futures = FuturesUnordered::new();
+                for symlink in &symlinks_to_materialize {
+                    symlink_futures.push(async move {
+                        fs::symlink(&symlink.target, &symlink.dest).await.err_tip(|| {
+                            format!(
+                                "Could not create symlink {} -> {}",
+                                symlink.target, symlink.dest
+                            )
+                        })
+                    });
                 }
-                .boxed(),
-            );
-        }
-
-        #[cfg(target_family = "unix")]
-        for symlink_node in directory.symlinks {
-            let dest = format!("{}/{}", current_directory, symlink_node.name);
-            extras.push(
-                async move {
-                    fs::symlink(&symlink_node.target, &dest).await.err_tip(|| {
-                        format!(
-                            "Could not create symlink {} -> {}",
-                            symlink_node.target, dest
-                        )
-                    })?;
-                    Ok(())
-                }
-                .boxed(),
-            );
-        }
-        let extras_fut = async move {
-            while extras.try_next().await?.is_some() {}
+                while symlink_futures.try_next().await?.is_some() {}
+            }
             Ok::<(), Error>(())
         };
 
@@ -506,7 +593,7 @@ pub fn download_to_directory<'a>(
         // hardlinker's recv() returns None.
         drop(tx);
 
-        try_join3(fetcher_fut, hardlinker_fut, extras_fut).await?;
+        try_join3(fetcher_fut, hardlinker_fut, symlinks_fut).await?;
         Ok(())
     }
     .boxed()
