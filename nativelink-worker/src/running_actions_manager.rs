@@ -362,17 +362,28 @@ pub async fn prepare_action_inputs(
 ) -> Result<(), Error> {
     // Try cache first if available
     if let Some(cache) = directory_cache {
+        // TEMPORARY INSTRUMENTATION (branch ec/pr2243-cache-hit-timing):
+        // per-span wall-clock timing for the directory-cache path. The cache
+        // *hit* path dominates input-prep time in cache-warm builds, so this
+        // breaks it into its three syscall-heavy spans. Not for merge.
+        let prepare_started_at = Instant::now();
+
         // `clonefile(2)` and `hardlink_directory_tree` both require the
         // destination to not exist. Remove the empty directory the caller
         // pre-created; without this the cache fails its precondition on every
         // action and silently falls back to the slow download path.
+        let remove_dir_started_at = Instant::now();
         fs::remove_dir(work_directory)
             .await
             .err_tip(|| format!("Failed to clear pre-created work directory {work_directory}"))?;
-        match cache
+        let remove_dir_elapsed = remove_dir_started_at.elapsed();
+
+        let get_or_create_started_at = Instant::now();
+        let get_or_create_result = cache
             .get_or_create(*digest, Path::new(work_directory))
-            .await
-        {
+            .await;
+        let get_or_create_elapsed = get_or_create_started_at.elapsed();
+        match get_or_create_result {
             Ok(cache_hit) => {
                 // The materialized tree's directories inherit the cache
                 // entry's read-only mode (0o555 on the macOS clonefile path).
@@ -382,9 +393,24 @@ pub async fn prepare_action_inputs(
                 // the tree writable; files are left read-only — they may be
                 // CAS-hardlinked and chmoding them would corrupt the shared
                 // inode for other in-flight actions.
+                let set_writable_started_at = Instant::now();
                 set_dir_writable_recursive(Path::new(work_directory))
                     .await
                     .err_tip(|| "Failed to make cached input directories writable")?;
+                let set_writable_elapsed = set_writable_started_at.elapsed();
+                // TEMPORARY INSTRUMENTATION: one summary line per cache-path
+                // prepare. `cache_hit` true = existing entry reused;
+                // false = entry materialized fresh (still pays clonefile).
+                info!(
+                    target: "prepare_action_inputs_timing",
+                    work_directory,
+                    cache_hit,
+                    remove_dir_ms = remove_dir_elapsed.as_millis() as u64,
+                    get_or_create_ms = get_or_create_elapsed.as_millis() as u64,
+                    set_writable_ms = set_writable_elapsed.as_millis() as u64,
+                    total_ms = prepare_started_at.elapsed().as_millis() as u64,
+                    "prepare_action_inputs directory-cache phase timing",
+                );
                 trace!(
                     ?digest,
                     work_directory, cache_hit, "Successfully prepared inputs via directory cache"
