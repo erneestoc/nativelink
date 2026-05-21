@@ -139,6 +139,143 @@ async fn fetch_slow_store_puts_in_fast_store_test() -> Result<(), Error> {
     Ok(())
 }
 
+// populate_fast_store_many pulls every requested blob from the slow store
+// into the fast store. Distinct sizes give distinct digests so several
+// blobs coexist.
+#[nativelink_test]
+async fn populate_fast_store_many_populates_all_blobs() -> Result<(), Error> {
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let fast_slow_store = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store.clone(),
+        slow_store.clone(),
+    );
+
+    let mut digests = Vec::new();
+    for (i, size) in [16usize, 32, 48].into_iter().enumerate() {
+        let data = make_random_data(size);
+        let digest = DigestInfo::try_new(VALID_HASH, 5000 + i).unwrap();
+        slow_store
+            .update_oneshot(digest, data.clone().into())
+            .await?;
+        digests.push((digest, data));
+    }
+    for (digest, _) in &digests {
+        assert_eq!(fast_store.has(*digest).await?, None);
+    }
+
+    let keys: Vec<StoreKey<'_>> = digests.iter().map(|(d, _)| StoreKey::from(*d)).collect();
+    fast_slow_store.populate_fast_store_many(&keys).await?;
+
+    for (digest, data) in &digests {
+        check_data(&fast_store, *digest, data, "fast_store").await?;
+    }
+    Ok(())
+}
+
+// A blob absent from both stores must surface NotFound, matching the
+// single-blob populate_fast_store path.
+#[nativelink_test]
+async fn populate_fast_store_many_missing_blob_is_not_found() -> Result<(), Error> {
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let fast_slow_store = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store,
+        slow_store.clone(),
+    );
+
+    let present_digest = DigestInfo::try_new(VALID_HASH, 6001).unwrap();
+    slow_store
+        .update_oneshot(present_digest, make_random_data(10).into())
+        .await?;
+    let missing_digest = DigestInfo::try_new(VALID_HASH, 6002).unwrap();
+
+    let keys = vec![
+        StoreKey::from(present_digest),
+        StoreKey::from(missing_digest),
+    ];
+    let err = fast_slow_store
+        .populate_fast_store_many(&keys)
+        .await
+        .expect_err("expected NotFound for the missing blob");
+    assert_eq!(err.code, Code::NotFound);
+    Ok(())
+}
+
+// Blobs already resident in the fast store must not be re-fetched from the
+// slow store, while still-missing blobs in the same batch are pulled in.
+#[nativelink_test]
+async fn populate_fast_store_many_skips_already_fast_blobs() -> Result<(), Error> {
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let fast_slow_store = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store.clone(),
+        slow_store.clone(),
+    );
+
+    // Resident only in the fast store - a slow-store fetch of it would fail.
+    let already_fast_data = make_random_data(10);
+    let already_fast_digest = DigestInfo::try_new(VALID_HASH, 7001).unwrap();
+    fast_store
+        .update_oneshot(already_fast_digest, already_fast_data.clone().into())
+        .await?;
+
+    // Resident only in the slow store - must be pulled into the fast store.
+    let slow_only_data = make_random_data(20);
+    let slow_only_digest = DigestInfo::try_new(VALID_HASH, 7002).unwrap();
+    slow_store
+        .update_oneshot(slow_only_digest, slow_only_data.clone().into())
+        .await?;
+    assert_eq!(fast_store.has(slow_only_digest).await?, None);
+
+    let keys = vec![
+        StoreKey::from(already_fast_digest),
+        StoreKey::from(slow_only_digest),
+    ];
+    fast_slow_store.populate_fast_store_many(&keys).await?;
+
+    check_data(&fast_store, already_fast_digest, &already_fast_data, "fast").await?;
+    check_data(&fast_store, slow_only_digest, &slow_only_data, "fast").await?;
+    Ok(())
+}
+
+// An empty key slice is a no-op.
+#[nativelink_test]
+async fn populate_fast_store_many_empty_is_ok() -> Result<(), Error> {
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let fast_slow_store = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store,
+        slow_store,
+    );
+    fast_slow_store.populate_fast_store_many(&[]).await?;
+    Ok(())
+}
+
 #[nativelink_test]
 async fn partial_reads_copy_full_to_fast_store_test() -> Result<(), Error> {
     let (fast_slow_store, fast_store, slow_store) = make_stores();

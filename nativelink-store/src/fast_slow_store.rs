@@ -23,6 +23,7 @@ use std::ffi::OsString;
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
+use futures::stream::{self, StreamExt};
 use futures::{FutureExt, join};
 use nativelink_config::stores::{FastSlowSpec, StoreDirection};
 use nativelink_error::{Code, Error, ErrorContext, ResultExt, make_err};
@@ -380,6 +381,148 @@ impl FastSlowStore {
             })
             .await
             .err_tip(|| "Failed to populate()")
+    }
+
+    /// Batched form of [`Self::populate_fast_store`].
+    ///
+    /// Ensures the fast store holds every key in `keys`. Compared to calling
+    /// `populate_fast_store` once per key this:
+    ///
+    ///   1. Issues one batched `fast_store.has_with_results` to skip blobs
+    ///      already local.
+    ///   2. Splits the still-missing blobs by size. "Small" blobs (whose
+    ///      `size_bytes` is at most `SMALL_BLOB_THRESHOLD`) are fetched from
+    ///      the slow store with one `get_many` call, which a `GrpcStore`
+    ///      slow leg serves via REAPI `BatchReadBlobs` - many blobs per RPC.
+    ///      Each returned blob is written into the fast store.
+    ///   3. "Large" blobs fall back to the per-blob streaming
+    ///      `populate_fast_store` path, since batching whole large blobs in
+    ///      memory is undesirable.
+    ///
+    /// A blob missing from the slow store surfaces the same `NotFound` error
+    /// the single-blob path produces.
+    pub async fn populate_fast_store_many(&self, keys: &[StoreKey<'_>]) -> Result<(), Error> {
+        /// Blobs at or below this size are eligible for batched fetch; larger
+        /// blobs stream individually. Several of these fit inside a typical
+        /// 4MB `BatchReadBlobs` request.
+        const SMALL_BLOB_THRESHOLD: u64 = 2 * 1024 * 1024;
+
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        // Step 1: one batched fast-store existence check.
+        let mut fast_results = vec![None; keys.len()];
+        self.fast_store
+            .has_with_results(keys, &mut fast_results)
+            .await
+            .err_tip(|| "While querying fast store in populate_fast_store_many")?;
+        let missing: Vec<StoreKey<'static>> = keys
+            .iter()
+            .zip(fast_results.iter())
+            .filter_map(|(k, r)| {
+                if r.is_none() {
+                    Some(k.borrow().into_owned())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        // If the fast store cannot be written, every still-missing key is an
+        // error - identical to the single-key path.
+        if self
+            .fast_store
+            .inner_store(Some(missing[0].borrow()))
+            .optimized_for(StoreOptimizations::NoopUpdates)
+            || self.fast_direction == StoreDirection::ReadOnly
+            || self.fast_direction == StoreDirection::Update
+        {
+            return Err(make_err!(
+                Code::Internal,
+                "Attempt to populate fast store that is read only or noop"
+            ));
+        }
+
+        // Step 2: split missing blobs into small (batchable) and large.
+        let mut small_keys: Vec<StoreKey<'static>> = Vec::new();
+        let mut large_keys: Vec<StoreKey<'static>> = Vec::new();
+        for key in missing {
+            let size = match key.borrow() {
+                StoreKey::Digest(d) => d.size_bytes(),
+                // Non-digest keys carry no size; treat as large so they
+                // take the safe per-key streaming path.
+                StoreKey::Str(_) => u64::MAX,
+            };
+            if size <= SMALL_BLOB_THRESHOLD {
+                small_keys.push(key);
+            } else {
+                large_keys.push(key);
+            }
+        }
+
+        // Step 3a: batched fetch of small blobs from the slow store.
+        if !small_keys.is_empty() {
+            let small_key_refs: Vec<StoreKey<'_>> =
+                small_keys.iter().map(StoreKey::borrow).collect();
+            let blobs = self
+                .slow_store
+                .get_many(&small_key_refs)
+                .await
+                .err_tip(|| "Batched slow-store read in populate_fast_store_many")?;
+            // Write each fetched blob into the fast store. Bounded
+            // concurrency keeps the number of in-flight fast-store writes
+            // finite for a large batch.
+            const FAST_STORE_WRITE_CONCURRENCY: usize = 32;
+            let writes = small_keys.iter().zip(blobs).map(|(key, blob)| {
+                let key = key.borrow();
+                async move {
+                    match blob {
+                        Ok(Some(data)) => self
+                            .fast_store
+                            .update_oneshot(key.borrow(), data)
+                            .await
+                            .err_tip(|| "Writing batched blob into fast store"),
+                        // A blob absent from the slow store is the same
+                        // NotFound the single-blob path would surface.
+                        Ok(None) => Err(make_err!(
+                            Code::NotFound,
+                            "Object {} not found in either fast or slow store. \
+                                If using multiple workers, ensure all workers share the same CAS storage path.",
+                            key.as_str()
+                        )),
+                        Err(e) => Err(e),
+                    }
+                }
+            });
+            stream::iter(writes)
+                .buffer_unordered(FAST_STORE_WRITE_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<()>, Error>>()?;
+        }
+
+        // Step 3b: large blobs use the per-blob streaming populate path,
+        // which composes with the get_loader de-duplication.
+        if !large_keys.is_empty() {
+            const LARGE_BLOB_FETCH_CONCURRENCY: usize = 16;
+            let fetches = large_keys.iter().map(|key| {
+                let key = key.borrow();
+                async move { self.populate_fast_store(key.borrow()).await }
+            });
+            stream::iter(fetches)
+                .buffer_unordered(LARGE_BLOB_FETCH_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<()>, Error>>()?;
+        }
+
+        Ok(())
     }
 
     /// Returns the range of bytes that should be sent given a slice bounds
