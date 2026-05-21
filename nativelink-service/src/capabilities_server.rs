@@ -33,11 +33,17 @@ use nativelink_util::operation_state_manager::ClientStateManager;
 use tonic::{Request, Response, Status};
 use tracing::{Level, instrument, warn};
 
-const MAX_BATCH_TOTAL_SIZE: i64 = 64 * 1024;
+/// Fallback `max_batch_total_size_bytes` advertised for an instance that was
+/// not present in the capabilities config. Matches the config default
+/// (`CapabilitiesConfig::max_batch_total_size_bytes`).
+const DEFAULT_MAX_BATCH_TOTAL_SIZE: i64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Default)]
 pub struct CapabilitiesServer {
     supported_node_properties_for_instance: HashMap<InstanceName, Vec<String>>,
+    /// Per-instance `max_batch_total_size_bytes` advertised via
+    /// `GetCapabilities`, sourced from each instance's `CapabilitiesConfig`.
+    max_batch_total_size_for_instance: HashMap<InstanceName, i64>,
 }
 
 impl CapabilitiesServer {
@@ -46,7 +52,15 @@ impl CapabilitiesServer {
         scheduler_map: &HashMap<String, Arc<dyn ClientStateManager>>,
     ) -> Result<Self, Error> {
         let mut supported_node_properties_for_instance = HashMap::new();
+        let mut max_batch_total_size_for_instance = HashMap::new();
         for config in configs {
+            // `max_batch_total_size_bytes` is a u64 in config; the proto
+            // field is an i64. Saturate rather than wrap so an absurdly
+            // large configured value still advertises a sane positive limit.
+            max_batch_total_size_for_instance.insert(
+                config.instance_name.clone(),
+                i64::try_from(config.max_batch_total_size_bytes).unwrap_or(i64::MAX),
+            );
             let mut properties = Vec::new();
             if let Some(remote_execution_cfg) = &config.remote_execution {
                 let scheduler =
@@ -82,6 +96,7 @@ impl CapabilitiesServer {
         }
         Ok(Self {
             supported_node_properties_for_instance,
+            max_batch_total_size_for_instance,
         })
     }
 
@@ -109,6 +124,11 @@ impl Capabilities for CapabilitiesServer {
         let maybe_supported_node_properties = self
             .supported_node_properties_for_instance
             .get(&instance_name);
+        let max_batch_total_size_bytes = self
+            .max_batch_total_size_for_instance
+            .get(&instance_name)
+            .copied()
+            .unwrap_or(DEFAULT_MAX_BATCH_TOTAL_SIZE);
         let execution_capabilities =
             maybe_supported_node_properties.map(|props_for_instance| ExecutionCapabilities {
                 digest_function: default_digest_hasher_func().proto_digest_func().into(),
@@ -136,7 +156,7 @@ impl Capabilities for CapabilitiesServer {
                     update_enabled: true,
                 }),
                 cache_priority_capabilities: None,
-                max_batch_total_size_bytes: MAX_BATCH_TOTAL_SIZE,
+                max_batch_total_size_bytes,
                 symlink_absolute_path_strategy: SymlinkAbsolutePathStrategy::Disallowed.into(),
                 supported_compressors: vec![],
                 supported_batch_update_compressors: vec![],

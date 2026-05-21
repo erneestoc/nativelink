@@ -183,6 +183,10 @@
             remote_execution: {
               scheduler: "MAIN_SCHEDULER",
             },
+            // Maximum total blob size advertised for BatchReadBlobs /
+            // BatchUpdateBlobs. Downstream workers use this to size their
+            // batched input fetches. Optional; defaults to 4MB.
+            max_batch_total_size_bytes: "4mb",
           },
         ],
         bytestream: [

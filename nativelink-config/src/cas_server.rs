@@ -147,6 +147,26 @@ pub struct CapabilitiesConfig {
     /// If not set the capabilities service will inform the client that remote
     /// execution is not supported.
     pub remote_execution: Option<CapabilitiesRemoteExecutionConfig>,
+
+    /// Maximum total size in bytes of blobs that may be transferred in a
+    /// single `BatchReadBlobs` / `BatchUpdateBlobs` request. This value is
+    /// advertised to clients (including downstream NativeLink workers
+    /// fetching action inputs) via the `GetCapabilities` RPC's
+    /// `max_batch_total_size_bytes` field; clients use it to decide how many
+    /// blobs to pack into one batch request.
+    ///
+    /// Default: 4194304 (4 MB), the de-facto REAPI standard. A value of 0
+    /// means "no limit", though in practice the gRPC message size limit
+    /// still applies.
+    #[serde(
+        default = "default_max_batch_total_size_bytes",
+        deserialize_with = "convert_data_size_with_shellexpand"
+    )]
+    pub max_batch_total_size_bytes: u64,
+}
+
+const fn default_max_batch_total_size_bytes() -> u64 {
+    4 * 1024 * 1024 // 4 MB
 }
 
 #[derive(Deserialize, Serialize, Debug)]
