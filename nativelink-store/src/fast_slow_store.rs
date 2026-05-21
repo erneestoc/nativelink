@@ -224,14 +224,24 @@ impl FastSlowStore {
         }
     }
 
+    /// `size_hint` is an already-known size for `key` in the slow store. When
+    /// `Some`, the per-blob `slow_store.has()` round-trip is skipped and the
+    /// hint is used directly as the fast-store write size. Callers that have
+    /// batched the existence check upfront (see `populate_fast_store_many`)
+    /// pass the size they learned there; a genuinely-missing blob is still
+    /// surfaced as `NotFound` by the slow-store `get()` below, exactly as the
+    /// `LazyExistenceOnSync` fast path already relies on.
     async fn populate_and_maybe_stream(
         self: Pin<&Self>,
         key: StoreKey<'_>,
         maybe_writer: Option<&mut DropCloserWriteHalf>,
         offset: u64,
         length: Option<u64>,
+        size_hint: Option<UploadSizeInfo>,
     ) -> Result<(), Error> {
-        let reader_stream_size = if self
+        let reader_stream_size = if let Some(size_hint) = size_hint {
+            size_hint
+        } else if self
             .slow_store
             .inner_store(Some(key.borrow()))
             .optimized_for(StoreOptimizations::LazyExistenceOnSync)
@@ -376,10 +386,147 @@ impl FastSlowStore {
 
         self.get_loader(key.borrow())
             .get_or_try_init(|| {
-                Pin::new(self).populate_and_maybe_stream(key.borrow(), None, 0, None)
+                Pin::new(self).populate_and_maybe_stream(key.borrow(), None, 0, None, None)
             })
             .await
             .err_tip(|| "Failed to populate()")
+    }
+
+    /// Batched form of [`Self::populate_fast_store`].
+    ///
+    /// Ensures the fast store is populated for every key in `keys`. Compared
+    /// to calling `populate_fast_store` once per key, this collapses the
+    /// existence checks into two batched store reads:
+    ///
+    ///   1. One `fast_store.has_with_results` over all keys: anything already
+    ///      local is skipped.
+    ///   2. One `slow_store.has_with_results` over the keys missing from the
+    ///      fast store: this is the only slow-store existence round-trip for
+    ///      the whole batch (instead of one per blob inside
+    ///      `populate_and_maybe_stream`).
+    ///
+    /// The size each blob reports from step 2 is then handed to
+    /// `populate_and_maybe_stream` as a size hint, so the slow store is not
+    /// re-`has()`'d a second time when the blob is streamed into the fast
+    /// store. A key missing from both stores yields the same `NotFound`
+    /// error that the per-blob path produces.
+    ///
+    /// Per-key fetches still go through the same `get_loader` de-duplication
+    /// as `populate_fast_store`, so a concurrent single-key `populate_fast_store`
+    /// for one of these keys shares the in-flight load rather than racing it.
+    pub async fn populate_fast_store_many(&self, keys: &[StoreKey<'_>]) -> Result<(), Error> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        // Step 1: one batched existence check against the fast store.
+        let mut fast_results = vec![None; keys.len()];
+        self.fast_store
+            .has_with_results(keys, &mut fast_results)
+            .await
+            .err_tip(|| "While querying fast store in populate_fast_store_many")?;
+
+        // Indices of keys not already present in the fast store.
+        let missing_indices: Vec<usize> = fast_results
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| if r.is_none() { Some(i) } else { None })
+            .collect();
+        if missing_indices.is_empty() {
+            return Ok(());
+        }
+
+        // If the fast store cannot be written, every still-missing key is an
+        // error - identical to the single-key path.
+        if self
+            .fast_store
+            .inner_store(Some(keys[missing_indices[0]].borrow()))
+            .optimized_for(StoreOptimizations::NoopUpdates)
+            || self.fast_direction == StoreDirection::ReadOnly
+            || self.fast_direction == StoreDirection::Update
+        {
+            return Err(make_err!(
+                Code::Internal,
+                "Attempt to populate fast store that is read only or noop"
+            ));
+        }
+
+        let missing_keys: Vec<StoreKey<'_>> =
+            missing_indices.iter().map(|&i| keys[i].borrow()).collect();
+
+        // Step 2: one batched existence check against the slow store. This is
+        // the only slow-store `has` for the whole batch; the size learned
+        // here is reused as the per-blob size hint below. Skipped entirely
+        // for slow stores that defer existence to sync time, matching the
+        // single-blob `LazyExistenceOnSync` fast path.
+        let slow_lazy_existence = self
+            .slow_store
+            .inner_store::<StoreKey<'_>>(None)
+            .optimized_for(StoreOptimizations::LazyExistenceOnSync);
+        let mut slow_sizes: Vec<Option<u64>> = vec![None; missing_keys.len()];
+        if !slow_lazy_existence {
+            self.slow_store
+                .has_with_results(&missing_keys, &mut slow_sizes)
+                .await
+                .err_tip(|| "While querying slow store in populate_fast_store_many")?;
+        }
+
+        // Step 3: stream each still-missing blob into the fast store,
+        // bounded by the same per-key loader de-duplication used by
+        // `populate_fast_store`. The size hint avoids a second slow-store
+        // `has()` inside `populate_and_maybe_stream`.
+        let fetches = missing_keys
+            .iter()
+            .zip(slow_sizes.into_iter())
+            .map(|(key, slow_size)| async move {
+                if !slow_lazy_existence {
+                    // The batched slow-store has() is authoritative: a key
+                    // absent there is absent everywhere (it was already
+                    // absent from the fast store). Produce the same
+                    // NotFound the single-blob path would.
+                    let size = slow_size.ok_or_else(|| {
+                        let err = make_err!(
+                            Code::NotFound,
+                            "Object {} not found in either fast or slow store. \
+                                If using multiple workers, ensure all workers share the same CAS storage path.",
+                            key.as_str()
+                        );
+                        if let StoreKey::Digest(d) = key.borrow() {
+                            err.with_context(ErrorContext::MissingDigest {
+                                hash: d.packed_hash().to_string(),
+                                size: d.size_bytes() as i64,
+                            })
+                        } else {
+                            err
+                        }
+                    })?;
+                    self.get_loader(key.borrow())
+                        .get_or_try_init(|| {
+                            Pin::new(self).populate_and_maybe_stream(
+                                key.borrow(),
+                                None,
+                                0,
+                                None,
+                                Some(UploadSizeInfo::ExactSize(size)),
+                            )
+                        })
+                        .await
+                        .err_tip(|| "Failed to populate() in populate_fast_store_many")
+                } else {
+                    // No batched slow-store size available; let
+                    // populate_and_maybe_stream take its LazyExistenceOnSync
+                    // path exactly as the single-blob call would.
+                    self.get_loader(key.borrow())
+                        .get_or_try_init(|| {
+                            Pin::new(self)
+                                .populate_and_maybe_stream(key.borrow(), None, 0, None, None)
+                        })
+                        .await
+                        .err_tip(|| "Failed to populate() in populate_fast_store_many")
+                }
+            });
+        futures::future::try_join_all(fetches).await?;
+        Ok(())
     }
 
     /// Returns the range of bytes that should be sent given a slice bounds
@@ -792,13 +939,19 @@ impl StoreDriver for FastSlowStore {
             if is_leader {
                 loader_guard
                     .get_or_try_init(|| {
-                        self.populate_and_maybe_stream(key.borrow(), writer.take(), offset, length)
+                        self.populate_and_maybe_stream(
+                            key.borrow(),
+                            writer.take(),
+                            offset,
+                            length,
+                            None,
+                        )
                     })
                     .await?;
                 false
             } else {
                 let load_fut = loader_guard.get_or_try_init(|| {
-                    self.populate_and_maybe_stream(key.borrow(), None, offset, length)
+                    self.populate_and_maybe_stream(key.borrow(), None, offset, length, None)
                 });
                 match tokio::time::timeout(LEADER_WAIT_TIMEOUT, load_fut).await {
                     Ok(result) => {

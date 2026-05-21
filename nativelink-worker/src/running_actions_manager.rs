@@ -67,7 +67,7 @@ use nativelink_util::common::{DigestInfo, fs};
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
 use nativelink_util::fs_util::set_dir_writable_recursive;
 use nativelink_util::metrics_utils::{AsyncCounterWrapper, CounterWithTime};
-use nativelink_util::store_trait::{Store, StoreLike, UploadSizeInfo};
+use nativelink_util::store_trait::{Store, StoreKey, StoreLike, UploadSizeInfo};
 use nativelink_util::{background_spawn, spawn, spawn_blocking};
 use parking_lot::Mutex;
 use prost::Message;
@@ -112,21 +112,13 @@ struct SideChannelInfo {
     failure: Option<SideChannelFailureReason>,
 }
 
-/// Maximum number of concurrent `populate_fast_store` (blob-fetch) calls in flight
-/// at one directory level.
-///
-/// Higher than `DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY` because fetch is
-/// network-bound (low marginal cost per extra in-flight request) while hardlink
-/// is metadata-bound (contends on APFS's per-volume lock on macOS).
-const DOWNLOAD_TO_DIRECTORY_FETCH_CONCURRENCY: usize = 128;
-
 /// Maximum number of concurrent `hardlink(2)` (plus `chmod`/`set_mtime`)
 /// futures in flight at one directory level.
 ///
 /// 64 is well above the inflection point on Linux filesystems but below the
 /// point at which APFS metadata contention on macOS dominates throughput.
-/// Composes with `DOWNLOAD_TO_DIRECTORY_FETCH_CONCURRENCY`: fetch and
-/// hardlink phases overlap, each with its own bound.
+/// Composes with `DOWNLOAD_TO_DIRECTORY_FETCH_BATCH_SIZE`: a chunk's fetch
+/// and the hardlink phase overlap, each with its own bound.
 const DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY: usize = 64;
 
 /// Maximum number of concurrent `Directory` proto fetches in flight while
@@ -137,6 +129,16 @@ const DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY: usize = 64;
 /// serialized by tree *depth* rather than by node count. This bound caps how
 /// many of a level's protos are read at once.
 const DOWNLOAD_TO_DIRECTORY_DIR_FETCH_CONCURRENCY: usize = 128;
+
+/// Number of unique blob digests whose store existence checks are collapsed
+/// into one batched `FastSlowStore::populate_fast_store_many` call.
+///
+/// `populate_fast_store_many` does one batched fast-store `has` and one
+/// batched slow-store `has` for the whole chunk, instead of two `has`
+/// round-trips per blob. The chunk is kept finite (rather than fetching the
+/// whole tree at once) so the hardlinker can begin draining a chunk's files
+/// while later chunks are still being fetched.
+const DOWNLOAD_TO_DIRECTORY_FETCH_BATCH_SIZE: usize = 128;
 
 /// Per-file work item materialized by `download_to_directory`. Collected up
 /// front so the fetcher (concurrent blob fetch) and hardlinker (concurrent
@@ -294,18 +296,20 @@ async fn collect_directory_tree(
 ///    `Directory` protos are therefore serialized by tree depth, not by node
 ///    count.
 ///
-/// 2. Fetcher: launches up to `DOWNLOAD_TO_DIRECTORY_FETCH_CONCURRENCY`
-///    `populate_fast_store` calls in flight, deduplicated per unique digest
-///    so the same blob is never fetched twice (the dedup is tree-wide). As
-///    each blob lands, every file that needs it is forwarded to the channel.
+/// 2. Fetcher: fetches blobs in chunks of
+///    `DOWNLOAD_TO_DIRECTORY_FETCH_BATCH_SIZE` unique digests, deduplicated
+///    per unique digest so the same blob is never fetched twice (the dedup
+///    is tree-wide). Each chunk's store existence checks are collapsed into
+///    a single batched `populate_fast_store_many` call. As each chunk lands,
+///    every file that needs one of its blobs is forwarded to the channel.
 ///
 /// 3. Hardlinker: consumes the channel, performing up to
 ///    `DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY` `hardlink(2)` /
 ///    `set_permissions` / `set_mtime` ops in flight.
 ///
-/// Hardlinking begins as soon as the first blob arrives - it does not wait
-/// for all fetches to complete. Symlinks run concurrently. Both share a
-/// single outer `try_join3` with the fetcher+hardlinker pipeline.
+/// Hardlinking begins as soon as the first chunk's blobs arrive - it does
+/// not wait for all fetches to complete. Symlinks run concurrently. Both
+/// share a single outer `try_join3` with the fetcher+hardlinker pipeline.
 ///
 /// We require the `FilesystemStore` to be the `fast` store of `FastSlowStore`. This is for
 /// efficiency reasons. We will request the `FastSlowStore` to populate the entry then we will
@@ -352,44 +356,43 @@ pub fn download_to_directory<'a>(
         let (tx, mut rx) = mpsc::channel::<usize>(DOWNLOAD_TO_DIRECTORY_HARDLINK_CONCURRENCY * 2);
 
         // ---- Fetcher future ----
-        // Launches all populate_fast_store calls upfront, capped at
-        // DOWNLOAD_TO_DIRECTORY_FETCH_CONCURRENCY concurrent fetches.
-        // As each fetch completes, every file index for that digest is sent.
+        // Fetches blobs in chunks of DOWNLOAD_TO_DIRECTORY_FETCH_BATCH_SIZE
+        // unique digests. Each chunk's existence checks are collapsed into a
+        // single batched `populate_fast_store_many` call (one batched
+        // fast-store `has` + one batched slow-store `has`) rather than two
+        // `has` round-trips per blob. Once a chunk's fetch completes, every
+        // file index for every digest in that chunk is forwarded to the
+        // hardlinker, so hardlinking overlaps with later chunks' fetches.
         let fetcher_fut = {
             let files_arc = files_arc.clone();
             let digest_to_file_indices_arc = digest_to_file_indices_arc.clone();
             let tx = tx.clone();
             async move {
-                let result: Result<(), Error> = futures::stream::iter(
-                    unique_digests.into_iter().map(Ok::<_, Error>),
-                )
-                .try_for_each_concurrent(
-                    DOWNLOAD_TO_DIRECTORY_FETCH_CONCURRENCY,
-                    |fetch_digest| {
-                        let tx = tx.clone();
-                        let files_arc = files_arc.clone();
-                        let digest_to_file_indices_arc = digest_to_file_indices_arc.clone();
-                        async move {
-                            // Zero-digest files don't need a fetch - the
-                            // hardlinker creates them by writing an empty
-                            // file. Skip straight to send.
-                            if !is_zero_digest(fetch_digest) {
-                                cas_store
-                                    .populate_fast_store(fetch_digest.into())
-                                    .await
-                                    .map_err(|e| {
-                                        e.append(format!("for digest {fetch_digest}"))
-                                    })?;
-                            }
-                            // Forward every file waiting on this blob.
+                let result: Result<(), Error> = async {
+                    for chunk in unique_digests.chunks(DOWNLOAD_TO_DIRECTORY_FETCH_BATCH_SIZE) {
+                        // Zero-digest blobs are never persisted by the store -
+                        // the hardlinker creates them directly. Exclude them
+                        // from the batched fetch but still forward their files.
+                        let fetch_keys: Vec<StoreKey<'_>> = chunk
+                            .iter()
+                            .filter(|d| !is_zero_digest(**d))
+                            .map(|d| StoreKey::from(*d))
+                            .collect();
+                        if !fetch_keys.is_empty() {
+                            cas_store
+                                .populate_fast_store_many(&fetch_keys)
+                                .await
+                                .err_tip(|| "While batch-populating fast store")?;
+                        }
+                        // Forward every file waiting on a blob in this chunk.
+                        for digest in chunk {
                             let indices = digest_to_file_indices_arc
-                                .get(&fetch_digest)
+                                .get(digest)
                                 .map_or(&[][..], Vec::as_slice);
                             for &idx in indices {
                                 // Re-validate the file is still here. If the
                                 // receiver dropped (hardlinker errored out),
-                                // bail with a "channel closed" error that
-                                // try_join3 will surface alongside the real
+                                // stop: try_join3 will surface the real
                                 // failure from the consumer side.
                                 let _ = files_arc.get(idx);
                                 if tx.send(idx).await.is_err() {
@@ -397,10 +400,10 @@ pub fn download_to_directory<'a>(
                                     return Ok(());
                                 }
                             }
-                            Ok::<(), Error>(())
                         }
-                    },
-                )
+                    }
+                    Ok::<(), Error>(())
+                }
                 .await;
                 // Drop our sender so the consumer's recv() can return None
                 // once all sends complete (the outer `tx` is also dropped
@@ -673,7 +676,7 @@ async fn upload_file(
             // Only upload if the digest doesn't already exist, this should be
             // a much cheaper operation than an upload.
             let cas_store = cas_store.as_store_driver_pin();
-            let store_key: nativelink_util::store_trait::StoreKey<'_> = digest.into();
+            let store_key: StoreKey<'_> = digest.into();
             let has_start = std::time::Instant::now();
             if cas_store
                 .has(store_key.borrow())
