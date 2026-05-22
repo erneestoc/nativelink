@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use futures::stream::{StreamExt, TryStreamExt};
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_proto::build::bazel::remote::execution::v2::{
     Directory as ProtoDirectory, DirectoryNode, FileNode, SymlinkNode,
@@ -35,6 +36,20 @@ use nativelink_util::store_trait::{StoreKey, StoreLike};
 use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, trace, warn};
+
+/// Maximum number of file/subdirectory materialization futures polled
+/// concurrently while constructing one directory level of a cache entry.
+///
+/// Matches `download_to_directory`'s `DOWNLOAD_TO_DIRECTORY_CONCURRENCY`: an
+/// unbounded fan-out produced thousands of parallel `hardlink(2)` calls
+/// fighting APFS's per-volume metadata lock and regressed throughput versus
+/// serial. 64 is the empirically chosen ceiling.
+const CONSTRUCT_CONCURRENCY: usize = 64;
+
+/// A boxed, `Send` future yielding the byte-size a child contributes to a
+/// cache-entry tree. Used to fan out file/subdir/symlink materialization
+/// inside `construct_directory` with bounded concurrency.
+type SizedFuture<'f> = Pin<Box<dyn Future<Output = Result<u64, Error>> + Send + 'f>>;
 
 /// Configuration for the directory cache
 #[derive(Debug, Clone)]
@@ -349,6 +364,9 @@ impl DirectoryCache {
     ///
     /// Each directory's final mode (0o755) is set at creation time, so no
     /// separate recursive permission pass is needed after construction.
+    ///
+    /// File creation and subdirectory recursion within one directory level run
+    /// concurrently, bounded to `CONSTRUCT_CONCURRENCY` in-flight futures.
     fn construct_directory<'a>(
         &'a self,
         digest: DigestInfo,
@@ -368,26 +386,54 @@ impl DirectoryCache {
             // (umask-independent) — no post-construction permission walk.
             self.create_dir_writable(dest_path).await?;
 
-            let mut total_size: u64 = 0;
+            // Build one future per child (file / subdirectory / symlink) and
+            // run them with bounded concurrency. Each future yields the bytes
+            // it contributes to the tree size. The futures are collected into
+            // an explicit `Vec` rather than built inline inside the stream
+            // combinator: building per-key futures via `.iter().map(closure)`
+            // inside `buffer_unordered` trips higher-ranked-lifetime inference
+            // because `create_file` handles `StoreKey<'_>` internally.
+            let mut futures: Vec<SizedFuture<'a>> = Vec::with_capacity(
+                directory.files.len() + directory.directories.len() + directory.symlinks.len(),
+            );
 
-            // Process files
-            for file in &directory.files {
-                self.create_file(dest_path, file).await?;
-                if let Some(file_digest) = &file.digest {
-                    // size_bytes is non-negative; clamp defensively.
-                    total_size += u64::try_from(file_digest.size_bytes).unwrap_or(0);
-                }
+            let dest_path_buf = dest_path.to_path_buf();
+
+            for file in directory.files {
+                // size_bytes is non-negative; clamp defensively.
+                let file_size = file
+                    .digest
+                    .as_ref()
+                    .map_or(0, |d| u64::try_from(d.size_bytes).unwrap_or(0));
+                let parent = dest_path_buf.clone();
+                futures.push(Box::pin(async move {
+                    self.create_file(&parent, &file).await?;
+                    Ok(file_size)
+                }));
             }
 
-            // Process subdirectories recursively
-            for dir_node in &directory.directories {
-                total_size += self.create_subdirectory(dest_path, dir_node).await?;
+            for dir_node in directory.directories {
+                let parent = dest_path_buf.clone();
+                futures.push(Box::pin(async move {
+                    self.create_subdirectory(&parent, &dir_node).await
+                }));
             }
 
-            // Process symlinks
-            for symlink in &directory.symlinks {
-                self.create_symlink(dest_path, symlink).await?;
+            for symlink in directory.symlinks {
+                let parent = dest_path_buf.clone();
+                futures.push(Box::pin(async move {
+                    self.create_symlink(&parent, &symlink).await?;
+                    Ok(0u64)
+                }));
             }
+
+            // Bounded fan-out: at most CONSTRUCT_CONCURRENCY futures polled at
+            // once. `try_fold` sums the per-child sizes and short-circuits on
+            // the first error.
+            let total_size = futures::stream::iter(futures)
+                .buffer_unordered(CONSTRUCT_CONCURRENCY)
+                .try_fold(0u64, |acc, child_size| async move { Ok(acc + child_size) })
+                .await?;
 
             Ok(total_size)
         })
@@ -1428,6 +1474,90 @@ mod tests {
                 "every concurrently-materialized destination must be correct"
             );
         }
+
+        Ok(())
+    }
+
+    /// OPT #3: a wide tree (many files at one level, plus a nested subdir)
+    /// must materialize byte-identically when its children are constructed
+    /// with bounded concurrency. Exercises the `buffer_unordered` fan-out.
+    #[nativelink_test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_parallel_construct_wide_tree() -> Result<(), Error> {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_root = temp_dir.path().join("cache");
+        let (cas_store, slow_store) = make_fast_slow_store(&temp_dir).await;
+
+        // 100 distinct files at the root.
+        const FILE_COUNT: usize = 100;
+        let mut root_files = Vec::with_capacity(FILE_COUNT);
+        let mut expected = Vec::with_capacity(FILE_COUNT);
+        for i in 0..FILE_COUNT {
+            let content = format!("content-of-file-{i}").into_bytes();
+            // Tags 100.. avoid colliding with other tests' fixed tags.
+            let tag = 100u8.wrapping_add(u8::try_from(i).unwrap());
+            let digest = upload_blob(&slow_store, tag, &content).await;
+            root_files.push(FileNode {
+                name: format!("file_{i}.txt"),
+                digest: Some(digest.into()),
+                is_executable: false,
+                ..Default::default()
+            });
+            expected.push((format!("file_{i}.txt"), content));
+        }
+
+        // One nested subdir with its own file.
+        let nested_content = b"nested-data".to_vec();
+        let nested_digest = upload_blob(&slow_store, 250, &nested_content).await;
+        let sub = ProtoDirectory {
+            files: vec![FileNode {
+                name: "deep.txt".to_string(),
+                digest: Some(nested_digest.into()),
+                is_executable: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut sub_data = Vec::new();
+        sub.encode(&mut sub_data).unwrap();
+        let sub_digest = upload_blob(&slow_store, 251, &sub_data).await;
+
+        let root = ProtoDirectory {
+            files: root_files,
+            directories: vec![DirectoryNode {
+                name: "sub".to_string(),
+                digest: Some(sub_digest.into()),
+            }],
+            ..Default::default()
+        };
+        let mut root_data = Vec::new();
+        root.encode(&mut root_data).unwrap();
+        let root_digest = upload_blob(&slow_store, 252, &root_data).await;
+
+        let config = DirectoryCacheConfig {
+            max_entries: 10,
+            max_size_bytes: 16 * 1024 * 1024,
+            cache_root,
+        };
+        let cache = DirectoryCache::new(config, cas_store).await?;
+
+        let dest = temp_dir.path().join("dest");
+        let hit = cache.get_or_create(root_digest, &dest).await?;
+        assert!(!hit, "first construction is a miss");
+
+        // Every one of the 100 root files must be present and byte-identical.
+        for (name, content) in &expected {
+            assert_eq!(
+                &fs::read(dest.join(name)).await?,
+                content,
+                "parallel-constructed file {name} must be byte-identical"
+            );
+        }
+        // The nested subdir's file too.
+        assert_eq!(
+            fs::read(dest.join("sub").join("deep.txt")).await?,
+            nested_content,
+            "nested file must be byte-identical"
+        );
 
         Ok(())
     }
