@@ -15,6 +15,7 @@
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
+use core::time::Duration;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,7 +35,8 @@ use nativelink_util::fs_util::{CloneMethod, hardlink_directory_tree, set_dir_wri
 use nativelink_util::store_trait::{StoreKey, StoreLike};
 use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, trace, warn};
+use tokio::time::Instant;
+use tracing::{debug, info, trace, warn};
 
 /// Configuration for the directory cache
 #[derive(Debug, Clone)]
@@ -55,6 +57,72 @@ impl Default for DirectoryCacheConfig {
             cache_root: std::env::temp_dir().join("nativelink_directory_cache"),
         }
     }
+}
+
+/// TEMPORARY INSTRUMENTATION (branch ec/pr2243-poc-all):
+/// Per-action accumulator for input-materialization timing. One instance is
+/// created per `get_or_create` call, threaded by `&mut` through the recursive
+/// `construct_directory`, and rendered into a single `materialize_timing`
+/// `info!` line at the end of the call. Logging-only — never read by, and
+/// never affecting, materialization/caching/eviction logic. Not for merge.
+///
+/// All `Duration` fields are wall-clock totals summed across the whole input
+/// tree; because directory construction on this branch is serial, a plain
+/// `&mut` accumulator suffices (no atomics).
+#[derive(Debug, Default, Clone, Copy)]
+struct MaterializeTiming {
+    /// Time in `get_and_decode_digest` fetching + decoding `Directory` protos.
+    proto_fetch: Duration,
+    /// Time fetching blob *bytes* from the CAS: `populate_fast_store` (the
+    /// remote-fetch / fast-vs-slow probe in the hardlink path) plus
+    /// `get_part_unchunked` (the copy path). Effectively the I/O fetch cost.
+    blob_fetch: Duration,
+    /// Time in `fs::write` writing file content (the copy path + zero-byte
+    /// files).
+    disk_write: Duration,
+    /// Time in `fs::hard_link` linking a CAS blob into a cache entry (the
+    /// optimized non-executable path).
+    hardlink: Duration,
+    /// Time in `hardlink_directory_tree` materializing the cache entry into
+    /// the destination workspace (APFS `clonefile(2)` on macOS).
+    clonefile: Duration,
+    /// Time setting modes: `create_dir_writable` (`fs::set_permissions` on
+    /// directories) and the executable-copy `chmod`.
+    mode_setting: Duration,
+    /// Time in `evict_if_needed` selecting eviction victims.
+    eviction: Duration,
+    /// Time spent waiting to acquire the per-digest construction lock.
+    lock_wait: Duration,
+    /// Files hardlinked from a `FilesystemStore` CAS blob (fast path).
+    files_hardlinked: u64,
+    /// Files copied because they are executable (need a private inode).
+    files_copied_executable: u64,
+    /// Files copied because the blob was not locally hardlinkable
+    /// (`NotFound` / no `FilesystemStore` fast tier).
+    files_copied_fallback: u64,
+    /// Zero-byte files written directly (digest af1349b9.../e3b0c442...).
+    zero_byte_files: u64,
+    /// Directories created.
+    directories: u64,
+    /// Symlinks created.
+    symlinks: u64,
+    /// Total bytes materialized, summed from `FileNode.digest.size_bytes`.
+    total_bytes: u64,
+}
+
+/// Converts a `Duration` to whole milliseconds as a `u64`.
+///
+/// `Duration::as_millis()` returns a `u128`; the value would only exceed
+/// `u64::MAX` after ~584 million years of elapsed wall-clock time, so the
+/// truncating cast is sound. The `#[allow]` keeps the Bazel
+/// `cast_possible_truncation` clippy aspect happy without changing the value,
+/// matching the existing `prepare_action_inputs_timing` instrumentation style.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "Duration::as_millis() cannot realistically exceed u64::MAX"
+)]
+const fn duration_ms(d: Duration) -> u64 {
+    d.as_millis() as u64
 }
 
 /// Metadata for a cached directory
@@ -165,6 +233,13 @@ impl DirectoryCache {
     /// * `Ok(false)` - Cache miss (directory was constructed)
     /// * `Err` - Error during construction or hardlinking
     pub async fn get_or_create(&self, digest: DigestInfo, dest_path: &Path) -> Result<bool, Error> {
+        // TEMPORARY INSTRUMENTATION (branch ec/pr2243-poc-all): per-action
+        // input-materialization timing accumulator. Threaded by `&mut` through
+        // `construct_directory`; rendered into one `materialize_timing` line
+        // before every return path of this call. Logging-only. Not for merge.
+        let call_started_at = Instant::now();
+        let mut timing = MaterializeTiming::default();
+
         // Fast path: check if already in cache.
         //
         // The cache write lock is held only long enough to bump `ref_count`
@@ -176,11 +251,14 @@ impl DirectoryCache {
         // deleted out from under the unlocked materialization.
         if let Some(cache_path) = self.acquire_entry(&digest).await {
             debug!(?digest, ?cache_path, "Directory cache HIT");
+            let clonefile_started_at = Instant::now();
             let result = hardlink_directory_tree(&cache_path, dest_path).await;
+            timing.clonefile += clonefile_started_at.elapsed();
             self.release_entry(&digest).await;
             match result {
                 Ok(method) => {
                     self.record_clone_method(method);
+                    Self::emit_timing(&digest, dest_path, true, &timing, call_started_at);
                     return Ok(true);
                 }
                 Err(e) => {
@@ -208,16 +286,63 @@ impl DirectoryCache {
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
+        // `lock_wait` measures contention on the per-digest construction
+        // mutex — non-zero only when another task is constructing this exact
+        // digest (single-flight stampede protection).
+        let lock_wait_started_at = Instant::now();
         let _guard = construction_lock.lock().await;
+        timing.lock_wait += lock_wait_started_at.elapsed();
 
         // Run the construction/materialization under the per-digest guard,
         // then drop the per-digest mutex from the stampede map regardless of
         // outcome so it cannot grow unbounded. The guard (`_guard`) is still
         // held until the end of this function — `forget_construction_lock`
         // only unmaps the Arc; any waiter already cloned it before blocking.
-        let result = self.construct_and_materialize(digest, dest_path).await;
+        let result = self
+            .construct_and_materialize(digest, dest_path, &mut timing)
+            .await;
         self.forget_construction_lock(&digest).await;
+        if let Ok(cache_hit) = &result {
+            Self::emit_timing(&digest, dest_path, *cache_hit, &timing, call_started_at);
+        }
         result
+    }
+
+    /// TEMPORARY INSTRUMENTATION (branch ec/pr2243-poc-all): emits the single
+    /// per-action `materialize_timing` summary line. Keyed by `work_directory`
+    /// (and `digest`) so it joins to the `prepare_action_inputs_timing` /
+    /// `prepare_action_inputs_digest` lines for the same action. Logging-only;
+    /// never affects control flow. Not for merge.
+    fn emit_timing(
+        digest: &DigestInfo,
+        dest_path: &Path,
+        cache_hit: bool,
+        timing: &MaterializeTiming,
+        call_started_at: Instant,
+    ) {
+        info!(
+            target: "materialize_timing",
+            work_directory = %dest_path.display(),
+            input_root_digest = %digest,
+            cache_hit,
+            proto_fetch_ms = duration_ms(timing.proto_fetch),
+            blob_fetch_ms = duration_ms(timing.blob_fetch),
+            disk_write_ms = duration_ms(timing.disk_write),
+            hardlink_ms = duration_ms(timing.hardlink),
+            clonefile_ms = duration_ms(timing.clonefile),
+            mode_setting_ms = duration_ms(timing.mode_setting),
+            eviction_ms = duration_ms(timing.eviction),
+            lock_wait_ms = duration_ms(timing.lock_wait),
+            total_ms = duration_ms(call_started_at.elapsed()),
+            files_hardlinked = timing.files_hardlinked,
+            files_copied_executable = timing.files_copied_executable,
+            files_copied_fallback = timing.files_copied_fallback,
+            zero_byte_files = timing.zero_byte_files,
+            directories = timing.directories,
+            symlinks = timing.symlinks,
+            total_bytes = timing.total_bytes,
+            "directory-cache per-action input-materialization timing breakdown",
+        );
     }
 
     /// The cache-miss body, run while holding the per-digest construction
@@ -227,11 +352,14 @@ impl DirectoryCache {
         &self,
         digest: DigestInfo,
         dest_path: &Path,
+        timing: &mut MaterializeTiming,
     ) -> Result<bool, Error> {
         // Re-check: another task may have just constructed this digest while
         // we waited on the construction lock.
         if let Some(cache_path) = self.acquire_entry(&digest).await {
+            let clonefile_started_at = Instant::now();
             let result = hardlink_directory_tree(&cache_path, dest_path).await;
+            timing.clonefile += clonefile_started_at.elapsed();
             self.release_entry(&digest).await;
             match result {
                 Ok(method) => {
@@ -245,7 +373,7 @@ impl DirectoryCache {
                         "Failed to hardlink after construction"
                     );
                     // Construct directly at dest_path as a last resort.
-                    self.construct_directory(digest, dest_path).await?;
+                    self.construct_directory(digest, dest_path, timing).await?;
                     return Ok(false);
                 }
             }
@@ -263,7 +391,9 @@ impl DirectoryCache {
         // with the CAS and every other in-flight action that hardlinked the
         // same blob — the inode-corruption bug PR #2347 fixed.
         let cache_path = self.get_cache_path(&digest);
-        let size = self.construct_directory(digest, &cache_path).await?;
+        let size = self
+            .construct_directory(digest, &cache_path, timing)
+            .await?;
 
         // Insert into the cache. Only the in-memory map mutation runs under
         // the write lock: `evict_if_needed` selects victims and removes them
@@ -278,7 +408,12 @@ impl DirectoryCache {
         // to 0 once the hardlink is done.
         let evicted = {
             let mut cache = self.cache.write().await;
+            // `eviction` measures only the in-memory victim selection here;
+            // the victims' filesystem `remove_dir_all` is dispatched off-lock
+            // onto a background task and is intentionally not timed.
+            let eviction_started_at = Instant::now();
             let evicted = self.evict_if_needed(size, &mut cache);
+            timing.eviction += eviction_started_at.elapsed();
             cache.insert(
                 digest,
                 CachedDirectoryMetadata {
@@ -294,7 +429,9 @@ impl DirectoryCache {
 
         // Hardlink to destination (unlocked). The entry is pinned
         // (`ref_count == 1`) so it cannot be evicted from under this hardlink.
+        let clonefile_started_at = Instant::now();
         let result = hardlink_directory_tree(&cache_path, dest_path).await;
+        timing.clonefile += clonefile_started_at.elapsed();
         self.release_entry(&digest).await;
         let method = result.err_tip(|| "Failed to hardlink newly cached directory")?;
         self.record_clone_method(method);
@@ -353,40 +490,50 @@ impl DirectoryCache {
         &'a self,
         digest: DigestInfo,
         dest_path: &'a Path,
+        timing: &'a mut MaterializeTiming,
     ) -> Pin<Box<dyn Future<Output = Result<u64, Error>> + Send + 'a>> {
         Box::pin(async move {
             debug!(?digest, ?dest_path, "Constructing directory");
 
-            // Fetch the Directory proto
+            // Fetch the Directory proto. `proto_fetch` accumulates the
+            // fetch+decode cost of every `Directory` proto in the tree.
+            let proto_fetch_started_at = Instant::now();
+            let directory: Result<ProtoDirectory, Error> =
+                get_and_decode_digest(self.cas_store.as_ref(), digest.into()).await;
+            timing.proto_fetch += proto_fetch_started_at.elapsed();
             let directory: ProtoDirectory =
-                get_and_decode_digest(self.cas_store.as_ref(), digest.into())
-                    .await
-                    .err_tip(|| format!("Failed to fetch directory digest: {digest:?}"))?;
+                directory.err_tip(|| format!("Failed to fetch directory digest: {digest:?}"))?;
 
             // Create the destination directory. It must be writable while it
             // is being populated; 0o755 is its final mode too, so set it now
             // (umask-independent) — no post-construction permission walk.
-            self.create_dir_writable(dest_path).await?;
+            self.create_dir_writable(dest_path, timing).await?;
+            timing.directories += 1;
 
             let mut total_size: u64 = 0;
 
             // Process files
             for file in &directory.files {
-                self.create_file(dest_path, file).await?;
+                self.create_file(dest_path, file, timing).await?;
                 if let Some(file_digest) = &file.digest {
                     // size_bytes is non-negative; clamp defensively.
-                    total_size += u64::try_from(file_digest.size_bytes).unwrap_or(0);
+                    let bytes = u64::try_from(file_digest.size_bytes).unwrap_or(0);
+                    total_size += bytes;
+                    timing.total_bytes += bytes;
                 }
             }
 
             // Process subdirectories recursively
             for dir_node in &directory.directories {
-                total_size += self.create_subdirectory(dest_path, dir_node).await?;
+                total_size += self
+                    .create_subdirectory(dest_path, dir_node, timing)
+                    .await?;
             }
 
             // Process symlinks
             for symlink in &directory.symlinks {
                 self.create_symlink(dest_path, symlink).await?;
+                timing.symlinks += 1;
             }
 
             Ok(total_size)
@@ -396,17 +543,24 @@ impl DirectoryCache {
     /// Creates `dir` (and any missing parents) and sets its mode to 0o755 so
     /// that it is writable while the cache entry is being populated and stays
     /// at a stable, umask-independent final mode afterwards.
-    async fn create_dir_writable(&self, dir: &Path) -> Result<(), Error> {
+    async fn create_dir_writable(
+        &self,
+        dir: &Path,
+        timing: &mut MaterializeTiming,
+    ) -> Result<(), Error> {
         fs::create_dir_all(dir)
             .await
             .err_tip(|| format!("Failed to create directory: {}", dir.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
-                .await
-                .err_tip(|| format!("Failed to set directory mode: {}", dir.display()))?;
+            let mode_setting_started_at = Instant::now();
+            let result = fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).await;
+            timing.mode_setting += mode_setting_started_at.elapsed();
+            result.err_tip(|| format!("Failed to set directory mode: {}", dir.display()))?;
         }
+        #[cfg(not(unix))]
+        let _ = timing;
         Ok(())
     }
 
@@ -425,7 +579,12 @@ impl DirectoryCache {
     ///  * If the blob is not locally hardlinkable (the fast tier is not a
     ///    `FilesystemStore`, or the blob is not present in it / was evicted),
     ///    fall back to fetch+write for that file rather than failing.
-    async fn create_file(&self, parent: &Path, file_node: &FileNode) -> Result<(), Error> {
+    async fn create_file(
+        &self,
+        parent: &Path,
+        file_node: &FileNode,
+        timing: &mut MaterializeTiming,
+    ) -> Result<(), Error> {
         let file_path = parent.join(&file_node.name);
         let digest = DigestInfo::try_from(
             file_node
@@ -444,25 +603,32 @@ impl DirectoryCache {
         // and a single failure aborts the whole DirectoryCache construction.
         // Short-circuit and write the empty file directly.
         if is_zero_digest(digest) {
-            fs::write(&file_path, b"")
-                .await
-                .err_tip(|| format!("Failed to write empty file: {}", file_path.display()))?;
+            let disk_write_started_at = Instant::now();
+            let result = fs::write(&file_path, b"").await;
+            timing.disk_write += disk_write_started_at.elapsed();
+            result.err_tip(|| format!("Failed to write empty file: {}", file_path.display()))?;
+            timing.zero_byte_files += 1;
             return Ok(());
         }
 
         // Executable files need their own inode to carry the +x bit without
         // mutating the shared CAS blob — copy, never hardlink.
         if file_node.is_executable {
-            return self.copy_file_to(&digest, &file_path, true).await;
+            self.copy_file_to(&digest, &file_path, true, timing).await?;
+            timing.files_copied_executable += 1;
+            return Ok(());
         }
 
         // Non-executable file: try to hardlink the CAS blob directly.
         if let Some(filesystem_store) = &self.filesystem_store {
             match self
-                .hardlink_cas_blob(filesystem_store, &digest, &file_path)
+                .hardlink_cas_blob(filesystem_store, &digest, &file_path, timing)
                 .await
             {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    timing.files_hardlinked += 1;
+                    return Ok(());
+                }
                 Err(e) if e.code == Code::NotFound => {
                     // The blob is not in the filesystem tier (e.g. it lives
                     // only in the slow store, or was evicted). Fall through
@@ -479,7 +645,10 @@ impl DirectoryCache {
 
         // Fallback: fetch the blob and write a private copy. Non-executable,
         // so no chmod is needed — the copy keeps its default mode.
-        self.copy_file_to(&digest, &file_path, false).await
+        self.copy_file_to(&digest, &file_path, false, timing)
+            .await?;
+        timing.files_copied_fallback += 1;
+        Ok(())
     }
 
     /// Hardlinks the `FilesystemStore` CAS blob for `digest` into `file_path`.
@@ -493,13 +662,20 @@ impl DirectoryCache {
         filesystem_store: &FilesystemStore,
         digest: &DigestInfo,
         file_path: &Path,
+        timing: &mut MaterializeTiming,
     ) -> Result<(), Error> {
         // Ensure the blob is in the fast (filesystem) tier so it has an
-        // on-disk file we can hardlink.
-        self.cas_store
+        // on-disk file we can hardlink. `populate_fast_store` is the
+        // "is this blob local? if not, pull it from the slow/remote store"
+        // step — its duration is the remote-fetch cost and ~0 when the blob
+        // is already local, so it accumulates into `blob_fetch`.
+        let blob_fetch_started_at = Instant::now();
+        let populate_result = self
+            .cas_store
             .populate_fast_store(StoreKey::Digest(*digest))
-            .await
-            .err_tip(|| format!("Failed to populate fast store for {digest}"))?;
+            .await;
+        timing.blob_fetch += blob_fetch_started_at.elapsed();
+        populate_result.err_tip(|| format!("Failed to populate fast store for {digest}"))?;
 
         let file_entry = filesystem_store
             .get_file_entry_for_digest(digest)
@@ -507,7 +683,8 @@ impl DirectoryCache {
             .err_tip(|| "Resolving CAS file entry for hardlink")?;
 
         let file_path = file_path.to_path_buf();
-        file_entry
+        let hardlink_started_at = Instant::now();
+        let result = file_entry
             .get_file_path_locked(move |src| async move {
                 fs::hard_link(&src, &file_path).await.err_tip(|| {
                     format!(
@@ -516,7 +693,9 @@ impl DirectoryCache {
                     )
                 })
             })
-            .await
+            .await;
+        timing.hardlink += hardlink_started_at.elapsed();
+        result
     }
 
     /// Fetches the blob for `digest` from the CAS and writes a private copy at
@@ -527,16 +706,22 @@ impl DirectoryCache {
         digest: &DigestInfo,
         file_path: &Path,
         executable: bool,
+        timing: &mut MaterializeTiming,
     ) -> Result<(), Error> {
+        // `get_part_unchunked` pulls the blob bytes from the CAS into RAM —
+        // network + slow-store fetch cost; accumulates into `blob_fetch`.
+        let blob_fetch_started_at = Instant::now();
         let data = self
             .cas_store
             .get_part_unchunked(StoreKey::Digest(*digest), 0, None)
-            .await
-            .err_tip(|| format!("Failed to fetch file: {}", file_path.display()))?;
+            .await;
+        timing.blob_fetch += blob_fetch_started_at.elapsed();
+        let data = data.err_tip(|| format!("Failed to fetch file: {}", file_path.display()))?;
 
-        fs::write(file_path, data.as_ref())
-            .await
-            .err_tip(|| format!("Failed to write file: {}", file_path.display()))?;
+        let disk_write_started_at = Instant::now();
+        let write_result = fs::write(file_path, data.as_ref()).await;
+        timing.disk_write += disk_write_started_at.elapsed();
+        write_result.err_tip(|| format!("Failed to write file: {}", file_path.display()))?;
 
         #[cfg(unix)]
         if executable {
@@ -544,14 +729,16 @@ impl DirectoryCache {
             // 0o555 (r-xr-xr-x): executable, read-only. This file has its own
             // private inode (just written above), so chmoding it cannot affect
             // any CAS blob or another action's hardlink.
-            fs::set_permissions(file_path, std::fs::Permissions::from_mode(0o555))
-                .await
-                .err_tip(|| {
-                    format!(
-                        "Failed to set executable permissions: {}",
-                        file_path.display()
-                    )
-                })?;
+            let mode_setting_started_at = Instant::now();
+            let chmod_result =
+                fs::set_permissions(file_path, std::fs::Permissions::from_mode(0o555)).await;
+            timing.mode_setting += mode_setting_started_at.elapsed();
+            chmod_result.err_tip(|| {
+                format!(
+                    "Failed to set executable permissions: {}",
+                    file_path.display()
+                )
+            })?;
         }
         #[cfg(not(unix))]
         let _ = executable;
@@ -565,6 +752,7 @@ impl DirectoryCache {
         &self,
         parent: &Path,
         dir_node: &DirectoryNode,
+        timing: &mut MaterializeTiming,
     ) -> Result<u64, Error> {
         let dir_path = parent.join(&dir_node.name);
         let digest =
@@ -576,7 +764,7 @@ impl DirectoryCache {
         trace!(?dir_path, ?digest, "Creating subdirectory");
 
         // Recursively construct subdirectory
-        self.construct_directory(digest, &dir_path).await
+        self.construct_directory(digest, &dir_path, timing).await
     }
 
     /// Creates a symlink from a `SymlinkNode`

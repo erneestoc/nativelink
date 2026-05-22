@@ -582,7 +582,23 @@ pub async fn prepare_action_inputs(
         }
     }
 
-    // Traditional path (cache disabled or failed)
+    // Traditional path (cache disabled or failed).
+    //
+    // TEMPORARY INSTRUMENTATION (branch ec/pr2243-poc-all): the directory
+    // cache emits a granular `materialize_timing` line per action; this
+    // fallback path bypasses it entirely. Emit a marker on the same target so
+    // the fallback case is visible when scanning `materialize_timing` logs and
+    // joinable by `work_directory` to the other prepare diagnostics. Full
+    // per-phase fallback instrumentation is intentionally out of scope — the
+    // directory-cache path covers ~every action. Logging-only. Not for merge.
+    info!(
+        target: "materialize_timing",
+        work_directory,
+        input_root_digest = %digest,
+        fallback = true,
+        "prepare_action_inputs fell back to download_to_directory \
+         (directory cache disabled or failed); no per-phase breakdown",
+    );
     download_to_directory(cas_store, filesystem_store, digest, work_directory).await
 }
 
