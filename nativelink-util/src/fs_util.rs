@@ -424,6 +424,16 @@ where
     })
 }
 
+/// Aggregate stats for a directory tree, produced by a single recursive walk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DirectoryStats {
+    /// Total size in bytes of all regular files in the tree.
+    pub total_size_bytes: u64,
+    /// Number of regular files in the tree (excludes directories and
+    /// symlinks).
+    pub file_count: u64,
+}
+
 /// Calculates the total size of a directory tree in bytes.
 /// Used for cache size tracking and LRU eviction.
 ///
@@ -433,28 +443,47 @@ where
 /// # Returns
 /// Total size in bytes, or Error if directory cannot be read
 pub async fn calculate_directory_size(dir: &Path) -> Result<u64, Error> {
-    error_if!(!dir.exists(), "Directory does not exist: {}", dir.display());
-
-    calculate_directory_size_impl(dir).await
+    Ok(calculate_directory_stats(dir).await?.total_size_bytes)
 }
 
-fn calculate_directory_size_impl<'a>(
+/// Calculates aggregate stats (total byte size and file count) of a directory
+/// tree in a single recursive walk.
+///
+/// This is a superset of [`calculate_directory_size`]: it performs exactly the
+/// same traversal but additionally counts files, so callers that need both
+/// numbers do not have to walk the tree twice.
+///
+/// # Arguments
+/// * `dir` - Directory to calculate stats for
+///
+/// # Returns
+/// [`DirectoryStats`], or Error if directory cannot be read
+pub async fn calculate_directory_stats(dir: &Path) -> Result<DirectoryStats, Error> {
+    error_if!(!dir.exists(), "Directory does not exist: {}", dir.display());
+
+    calculate_directory_stats_impl(dir).await
+}
+
+fn calculate_directory_stats_impl<'a>(
     path: &'a Path,
-) -> Pin<Box<dyn Future<Output = Result<u64, Error>> + Send + 'a>> {
+) -> Pin<Box<dyn Future<Output = Result<DirectoryStats, Error>> + Send + 'a>> {
     Box::pin(async move {
         let metadata = fs::metadata(path)
             .await
             .err_tip(|| format!("Failed to get metadata for: {}", path.display()))?;
 
         if metadata.is_file() {
-            return Ok(metadata.len());
+            return Ok(DirectoryStats {
+                total_size_bytes: metadata.len(),
+                file_count: 1,
+            });
         }
 
         if !metadata.is_dir() {
-            return Ok(0);
+            return Ok(DirectoryStats::default());
         }
 
-        let mut total_size = 0u64;
+        let mut stats = DirectoryStats::default();
         let mut entries = fs::read_dir(path)
             .await
             .err_tip(|| format!("Failed to read directory: {}", path.display()))?;
@@ -464,10 +493,12 @@ fn calculate_directory_size_impl<'a>(
             .await
             .err_tip(|| format!("Failed to get next entry in: {}", path.display()))?
         {
-            total_size += calculate_directory_size_impl(&entry.path()).await?;
+            let child = calculate_directory_stats_impl(&entry.path()).await?;
+            stats.total_size_bytes += child.total_size_bytes;
+            stats.file_count += child.file_count;
         }
 
-        Ok(total_size)
+        Ok(stats)
     })
 }
 
@@ -789,6 +820,30 @@ mod tests {
         // "Nested file" = 11 bytes
         // Total = 24 bytes
         assert_eq!(size, 24);
+
+        Ok(())
+    }
+
+    /// `calculate_directory_stats` must report the same byte total as
+    /// `calculate_directory_size` (they share one traversal) and additionally
+    /// count every regular file in the tree, recursing into subdirectories.
+    #[nativelink_test("crate")]
+    async fn test_calculate_directory_stats() -> Result<(), Error> {
+        let (_temp_dir, test_dir) = create_test_directory().await?;
+
+        let stats = calculate_directory_stats(&test_dir).await?;
+
+        // Same 13 + 11 = 24 byte total as calculate_directory_size.
+        assert_eq!(stats.total_size_bytes, 24);
+        // Two regular files: file1.txt at the root and subdir/file2.txt.
+        assert_eq!(stats.file_count, 2);
+
+        // The byte total must agree with the size-only entry point, which is
+        // now a thin wrapper over calculate_directory_stats.
+        assert_eq!(
+            stats.total_size_bytes,
+            calculate_directory_size(&test_dir).await?,
+        );
 
         Ok(())
     }

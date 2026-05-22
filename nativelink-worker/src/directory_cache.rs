@@ -18,7 +18,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_proto::build::bazel::remote::execution::v2::{
@@ -28,12 +28,13 @@ use nativelink_store::ac_utils::get_and_decode_digest;
 use nativelink_store::cas_utils::is_zero_digest;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::fs_util::{
-    CloneMethod, hardlink_directory_tree, set_dir_writable_recursive, set_readonly_recursive,
+    CloneMethod, calculate_directory_stats, hardlink_directory_tree, set_dir_writable_recursive,
+    set_readonly_recursive,
 };
 use nativelink_util::store_trait::{Store, StoreKey, StoreLike};
 use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Configuration for the directory cache
 #[derive(Debug, Clone)]
@@ -96,6 +97,14 @@ pub struct DirectoryCache {
     hardlink_hits: AtomicU64,
 }
 
+/// TEMPORARY INSTRUMENTATION helper (branch ec/pr2243-get-or-create-spans):
+/// converts a [`core::time::Duration`] to whole milliseconds as a `u64`,
+/// saturating instead of truncating. Used only by the diagnostic `info!`
+/// spans in `get_or_create`. Not for merge.
+fn duration_ms(elapsed: core::time::Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
 impl DirectoryCache {
     /// Creates a new `DirectoryCache`
     pub async fn new(config: DirectoryCacheConfig, cas_store: Store) -> Result<Self, Error> {
@@ -137,25 +146,60 @@ impl DirectoryCache {
     /// * `Ok(false)` - Cache miss (directory was constructed)
     /// * `Err` - Error during construction or hardlinking
     pub async fn get_or_create(&self, digest: DigestInfo, dest_path: &Path) -> Result<bool, Error> {
+        // TEMPORARY INSTRUMENTATION (branch ec/pr2243-get-or-create-spans):
+        // per-phase wall-clock timing for `get_or_create`. Measurement of
+        // `prepare_action_inputs` showed `get_or_create` dominates the
+        // directory-cache prepare path, but its internal phases were never
+        // split out — the "95%" was *labelled* "the clonefile" without proof.
+        // This emits one `info!` line per call under the `get_or_create_spans`
+        // target, splitting the miss path into its real phases: cache_check,
+        // construct_directory (CAS fetch + filesystem build), set_readonly,
+        // calculate_size, evict, and hardlink (the actual clonefile(2)). It
+        // also logs the digest and the constructed tree's size + file count so
+        // the p99/max outliers can be correlated with tree shape. Additive
+        // logging only — zero behavior change. Not for merge.
+        let call_started_at = Instant::now();
+
         // Fast path: check if already in cache
+        let cache_check_started_at = Instant::now();
         {
             let mut cache = self.cache.write().await;
             if let Some(metadata) = cache.get_mut(&digest) {
                 // Update access time and ref count
                 metadata.last_access = SystemTime::now();
                 metadata.ref_count += 1;
+                let cache_path = metadata.path.clone();
+                let cache_size = metadata.size;
 
                 debug!(
                     ?digest,
-                    path = ?metadata.path,
+                    path = ?cache_path,
                     "Directory cache HIT"
                 );
 
                 // Try to hardlink from cache
-                match hardlink_directory_tree(&metadata.path, dest_path).await {
+                let hardlink_started_at = Instant::now();
+                let hardlink_result = hardlink_directory_tree(&cache_path, dest_path).await;
+                let hardlink_elapsed = hardlink_started_at.elapsed();
+                match hardlink_result {
                     Ok(method) => {
                         self.record_clone_method(method);
-                        metadata.ref_count -= 1;
+                        // Re-borrow: the await above released the lock guard
+                        // borrow of `metadata`; reacquire to decrement.
+                        if let Some(metadata) = cache.get_mut(&digest) {
+                            metadata.ref_count -= 1;
+                        }
+                        info!(
+                            target: "get_or_create_spans",
+                            ?digest,
+                            outcome = "cache_hit_fastpath",
+                            cached_size_bytes = cache_size,
+                            cache_check_ms =
+                                duration_ms(cache_check_started_at.elapsed()),
+                            hardlink_ms = duration_ms(hardlink_elapsed),
+                            total_ms = duration_ms(call_started_at.elapsed()),
+                            "get_or_create phase timing",
+                        );
                         return Ok(true);
                     }
                     Err(e) => {
@@ -164,12 +208,15 @@ impl DirectoryCache {
                             error = ?e,
                             "Failed to hardlink from cache, will reconstruct"
                         );
-                        metadata.ref_count -= 1;
+                        if let Some(metadata) = cache.get_mut(&digest) {
+                            metadata.ref_count -= 1;
+                        }
                         // Fall through to reconstruction
                     }
                 }
             }
         }
+        let cache_check_elapsed = cache_check_started_at.elapsed();
 
         debug!(?digest, "Directory cache MISS");
 
@@ -189,9 +236,25 @@ impl DirectoryCache {
         {
             let cache = self.cache.read().await;
             if let Some(metadata) = cache.get(&digest) {
-                return match hardlink_directory_tree(&metadata.path, dest_path).await {
+                let cache_path = metadata.path.clone();
+                let cache_size = metadata.size;
+                drop(cache);
+                let hardlink_started_at = Instant::now();
+                let hardlink_result = hardlink_directory_tree(&cache_path, dest_path).await;
+                let hardlink_elapsed = hardlink_started_at.elapsed();
+                return match hardlink_result {
                     Ok(method) => {
                         self.record_clone_method(method);
+                        info!(
+                            target: "get_or_create_spans",
+                            ?digest,
+                            outcome = "cache_hit_construct_lock",
+                            cached_size_bytes = cache_size,
+                            cache_check_ms = duration_ms(cache_check_elapsed),
+                            hardlink_ms = duration_ms(hardlink_elapsed),
+                            total_ms = duration_ms(call_started_at.elapsed()),
+                            "get_or_create phase timing",
+                        );
                         Ok(true)
                     }
                     Err(e) => {
@@ -201,7 +264,18 @@ impl DirectoryCache {
                             "Failed to hardlink after construction"
                         );
                         // Construct directly at dest_path
+                        let construct_started_at = Instant::now();
                         self.construct_directory(digest, dest_path).await?;
+                        info!(
+                            target: "get_or_create_spans",
+                            ?digest,
+                            outcome = "cache_miss_direct_construct",
+                            cache_check_ms = duration_ms(cache_check_elapsed),
+                            construct_directory_ms =
+                                duration_ms(construct_started_at.elapsed()),
+                            total_ms = duration_ms(call_started_at.elapsed()),
+                            "get_or_create phase timing",
+                        );
                         Ok(false)
                     }
                 };
@@ -210,19 +284,27 @@ impl DirectoryCache {
 
         // Construct the directory in cache
         let cache_path = self.get_cache_path(&digest);
+        let construct_started_at = Instant::now();
         self.construct_directory(digest, &cache_path).await?;
+        let construct_directory_elapsed = construct_started_at.elapsed();
 
         // Make it read-only to prevent modifications
+        let set_readonly_started_at = Instant::now();
         set_readonly_recursive(&cache_path)
             .await
             .err_tip(|| "Failed to set cache directory to readonly")?;
+        let set_readonly_elapsed = set_readonly_started_at.elapsed();
 
-        // Calculate size
-        let size = nativelink_util::fs_util::calculate_directory_size(&cache_path)
+        // Calculate size (and file count, for diagnostic correlation).
+        let calculate_size_started_at = Instant::now();
+        let stats = calculate_directory_stats(&cache_path)
             .await
             .err_tip(|| "Failed to calculate directory size")?;
+        let size = stats.total_size_bytes;
+        let calculate_size_elapsed = calculate_size_started_at.elapsed();
 
         // Add to cache
+        let evict_started_at = Instant::now();
         {
             let mut cache = self.cache.write().await;
 
@@ -239,12 +321,31 @@ impl DirectoryCache {
                 },
             );
         }
+        let evict_elapsed = evict_started_at.elapsed();
 
         // Hardlink to destination
+        let hardlink_started_at = Instant::now();
         let method = hardlink_directory_tree(&cache_path, dest_path)
             .await
             .err_tip(|| "Failed to hardlink newly cached directory")?;
         self.record_clone_method(method);
+        let hardlink_elapsed = hardlink_started_at.elapsed();
+
+        info!(
+            target: "get_or_create_spans",
+            ?digest,
+            outcome = "cache_miss_construct",
+            tree_size_bytes = size,
+            tree_file_count = stats.file_count,
+            cache_check_ms = duration_ms(cache_check_elapsed),
+            construct_directory_ms = duration_ms(construct_directory_elapsed),
+            set_readonly_ms = duration_ms(set_readonly_elapsed),
+            calculate_size_ms = duration_ms(calculate_size_elapsed),
+            evict_ms = duration_ms(evict_elapsed),
+            hardlink_ms = duration_ms(hardlink_elapsed),
+            total_ms = duration_ms(call_started_at.elapsed()),
+            "get_or_create phase timing",
+        );
 
         Ok(false)
     }
