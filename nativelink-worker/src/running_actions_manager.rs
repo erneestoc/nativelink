@@ -341,6 +341,89 @@ pub fn download_to_directory<'a>(
     .boxed()
 }
 
+/// TEMPORARY INSTRUMENTATION (branch ec/pr2243-digest-churn-diag): a single
+/// flattened input-tree entry. `path` is the input-root-relative POSIX path of
+/// a regular file; `content_digest` is its CAS content digest, taken directly
+/// from the REAPI `FileNode` proto (never re-hashed). Not for merge.
+#[derive(Debug)]
+struct DiagInputEntry {
+    path: String,
+    content_digest: DigestInfo,
+    is_executable: bool,
+}
+
+/// TEMPORARY INSTRUMENTATION (branch ec/pr2243-digest-churn-diag): recursively
+/// decodes the REAPI `Directory` Merkle tree rooted at `digest` from the CAS
+/// and collects a flat list of every regular file with its content digest.
+///
+/// This reads only `Directory` protos (small metadata nodes) — it never reads
+/// or re-hashes file content; the content digests are the ones already carried
+/// by each `FileNode`. The cross-build text diff of these entries (sorted by
+/// path) localizes exactly which input file's bytes changed when an action's
+/// input-root digest churns. Logging-only; not for merge.
+///
+/// `digest` and `prefix` are taken by value (not by reference) so the recursive
+/// `BoxFuture` carries no borrow of caller-local data — only `cas_store`'s
+/// lifetime is threaded through.
+fn flatten_input_tree_for_diag(
+    cas_store: &FastSlowStore,
+    digest: DigestInfo,
+    prefix: String,
+) -> BoxFuture<'_, Result<Vec<DiagInputEntry>, Error>> {
+    async move {
+        let directory = get_and_decode_digest::<ProtoDirectory>(cas_store, digest.into())
+            .await
+            .err_tip(|| "diag: converting digest to Directory")?;
+        let mut entries = Vec::new();
+        for file in directory.files {
+            let content_digest: DigestInfo = file
+                .digest
+                .err_tip(|| "diag: expected Digest in Directory::file::digest")?
+                .try_into()
+                .err_tip(|| "diag: in Directory::file::digest")?;
+            let path = if prefix.is_empty() {
+                file.name.clone()
+            } else {
+                format!("{prefix}/{}", file.name)
+            };
+            entries.push(DiagInputEntry {
+                path,
+                content_digest,
+                is_executable: file.is_executable,
+            });
+        }
+        let mut subdir_futures = Vec::new();
+        for subdir in directory.directories {
+            let subdir_digest: DigestInfo = subdir
+                .digest
+                .err_tip(|| "diag: expected Digest in Directory::directories::digest")?
+                .try_into()
+                .err_tip(|| "diag: in Directory::directories::digest")?;
+            let subdir_prefix = if prefix.is_empty() {
+                subdir.name.clone()
+            } else {
+                format!("{prefix}/{}", subdir.name)
+            };
+            subdir_futures.push(flatten_input_tree_for_diag(
+                cas_store,
+                subdir_digest,
+                subdir_prefix,
+            ));
+        }
+        // Gate concurrency the same way `download_to_directory` does, to keep
+        // this diagnostic walk from drowning the CAS in parallel requests.
+        let subdir_results = futures::stream::iter(subdir_futures)
+            .buffer_unordered(DOWNLOAD_TO_DIRECTORY_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?;
+        for sub_entries in subdir_results {
+            entries.extend(sub_entries);
+        }
+        Ok(entries)
+    }
+    .boxed()
+}
+
 /// Prepares action inputs by first trying the directory cache (if available),
 /// then falling back to traditional `download_to_directory`.
 ///
@@ -360,6 +443,56 @@ pub async fn prepare_action_inputs(
     digest: &DigestInfo,
     work_directory: &str,
 ) -> Result<(), Error> {
+    // TEMPORARY INSTRUMENTATION (branch ec/pr2243-digest-churn-diag):
+    // emit one line per prepare call recording the input-root digest (the
+    // directory-cache key) plus a flattened input-tree summary, so two builds'
+    // logs can be diffed to find which actions' input-root digests churn and
+    // which input file's content changed. Runs on both the cache and fallback
+    // paths, before any materialization. `work_directory` is the per-action
+    // join key matching this line to the `output_paths`/identity line emitted
+    // by `inner_prepare_action`. Logging-only; not for merge.
+    //
+    // The flatten reads only `Directory` protos from the CAS; it never reads
+    // or re-hashes file content. A flatten failure must not affect the action,
+    // so the error is logged and the prepare proceeds normally.
+    match flatten_input_tree_for_diag(cas_store, *digest, String::new()).await {
+        Ok(mut input_files) => {
+            input_files.sort_by(|a, b| a.path.cmp(&b.path));
+            // `tree` is a deterministic, sorted, single-line rendering of the
+            // input tree: `path|content_digest|x` (x present only when the
+            // file is executable), entries separated by spaces. A cross-build
+            // text diff of this field localizes the changed file directly.
+            let tree = input_files
+                .iter()
+                .map(|e| {
+                    if e.is_executable {
+                        format!("{}|{}|x", e.path, e.content_digest)
+                    } else {
+                        format!("{}|{}", e.path, e.content_digest)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            info!(
+                target: "prepare_action_inputs_digest",
+                work_directory,
+                input_root_digest = %digest,
+                input_file_count = input_files.len(),
+                tree,
+                "prepare_action_inputs input-root digest + flattened tree",
+            );
+        }
+        Err(e) => {
+            warn!(
+                target: "prepare_action_inputs_digest",
+                work_directory,
+                input_root_digest = %digest,
+                ?e,
+                "prepare_action_inputs diagnostic flatten failed (non-fatal)",
+            );
+        }
+    }
+
     // Try cache first if available
     if let Some(cache) = directory_cache {
         // TEMPORARY INSTRUMENTATION (branch ec/pr2243-cache-hit-timing):
@@ -401,16 +534,28 @@ pub async fn prepare_action_inputs(
                 // TEMPORARY INSTRUMENTATION: one summary line per cache-path
                 // prepare. `cache_hit` true = existing entry reused;
                 // false = entry materialized fresh (still pays clonefile).
-                info!(
-                    target: "prepare_action_inputs_timing",
-                    work_directory,
-                    cache_hit,
-                    remove_dir_ms = remove_dir_elapsed.as_millis() as u64,
-                    get_or_create_ms = get_or_create_elapsed.as_millis() as u64,
-                    set_writable_ms = set_writable_elapsed.as_millis() as u64,
-                    total_ms = prepare_started_at.elapsed().as_millis() as u64,
-                    "prepare_action_inputs directory-cache phase timing",
-                );
+                // The `as u64` casts of `Duration::as_millis()` (a `u128`)
+                // would only truncate after ~584 million years of elapsed
+                // wall-clock time, so the cast is sound; the allow keeps the
+                // Bazel `cast_possible_truncation` clippy aspect happy without
+                // changing the logged values. Pre-existing from branch
+                // ec/pr2243-cache-hit-timing; not for merge.
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "Duration::as_millis() cannot realistically exceed u64::MAX"
+                )]
+                {
+                    info!(
+                        target: "prepare_action_inputs_timing",
+                        work_directory,
+                        cache_hit,
+                        remove_dir_ms = remove_dir_elapsed.as_millis() as u64,
+                        get_or_create_ms = get_or_create_elapsed.as_millis() as u64,
+                        set_writable_ms = set_writable_elapsed.as_millis() as u64,
+                        total_ms = prepare_started_at.elapsed().as_millis() as u64,
+                        "prepare_action_inputs directory-cache phase timing",
+                    );
+                }
                 trace!(
                     ?digest,
                     work_directory, cache_hit, "Successfully prepared inputs via directory cache"
@@ -1016,6 +1161,39 @@ impl RunningActionImpl {
                 .await?;
         }
         debug!(?command, "Worker received command");
+        // TEMPORARY INSTRUMENTATION (branch ec/pr2243-digest-churn-diag):
+        // emit the stable cross-build action identity for this prepare. The
+        // input-root digest itself churns build-to-build (that is the bug
+        // under investigation), so it cannot identify "the same action"
+        // across two builds. The REAPI `Command`'s declared output paths are
+        // content-independent — Bazel declares outputs at fixed
+        // workspace-relative paths regardless of input bytes — so the sorted
+        // set of output paths is used as the stable identity. `work_directory`
+        // is the per-action join key tying this line to the
+        // `prepare_action_inputs_digest` digest line emitted earlier in
+        // `prepare_action_inputs`. A client populates either `output_paths`
+        // (REAPI v2.1+) or the legacy `output_files`/`output_directories`
+        // pair; all three are merged so the identity is robust either way.
+        // Logging-only; not for merge.
+        {
+            let mut output_identity = command
+                .output_paths
+                .iter()
+                .chain(command.output_files.iter())
+                .chain(command.output_directories.iter())
+                .cloned()
+                .collect::<Vec<_>>();
+            output_identity.sort_unstable();
+            output_identity.dedup();
+            info!(
+                target: "prepare_action_inputs_digest",
+                work_directory = %self.work_directory,
+                operation_id = %self.operation_id,
+                output_identity = output_identity.join(":"),
+                output_path_count = output_identity.len(),
+                "prepare_action_inputs stable action identity (output paths)",
+            );
+        }
         {
             let mut state = self.state.lock();
             state.command_proto = Some(command);
