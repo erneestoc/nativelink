@@ -65,7 +65,6 @@ use nativelink_util::action_messages::{
 };
 use nativelink_util::common::{DigestInfo, fs};
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
-use nativelink_util::fs_util::set_dir_writable_recursive;
 use nativelink_util::metrics_utils::{AsyncCounterWrapper, CounterWithTime};
 use nativelink_util::store_trait::{Store, StoreLike, UploadSizeInfo};
 use nativelink_util::{background_spawn, spawn, spawn_blocking};
@@ -518,19 +517,23 @@ pub async fn prepare_action_inputs(
         let get_or_create_elapsed = get_or_create_started_at.elapsed();
         match get_or_create_result {
             Ok(cache_hit) => {
-                // The materialized tree's directories inherit the cache
-                // entry's read-only mode (0o555 on the macOS clonefile path).
-                // Bazel actions declare outputs at paths nested inside input
-                // subdirectories, and creating those files needs write
-                // permission on the parent directory. Make every directory in
-                // the tree writable; files are left read-only — they may be
-                // CAS-hardlinked and chmoding them would corrupt the shared
-                // inode for other in-flight actions.
-                let set_writable_started_at = Instant::now();
-                set_dir_writable_recursive(Path::new(work_directory))
-                    .await
-                    .err_tip(|| "Failed to make cached input directories writable")?;
-                let set_writable_elapsed = set_writable_started_at.elapsed();
+                // The materialized tree is already usable. The directory
+                // cache locks each entry down with `set_readonly_recursive`,
+                // which leaves directories writable (0o755) and only makes
+                // files read-only (0o555). The macOS `clonefile(2)` path
+                // copies those modes verbatim and the Linux hardlink walk
+                // creates fresh writable directories, so every directory in
+                // the materialized tree already accepts the nested output
+                // files Bazel actions declare — no separate per-materialize
+                // recursive chmod walk is needed here. Files stay read-only,
+                // preserving the hermeticity contract and the CAS-hardlink
+                // shared-inode invariant.
+                //
+                // POC-INTEGRATION NOTE: Workstream A removed the
+                // `set_dir_writable_recursive` walk, so the
+                // `prepare_action_inputs_timing` line below no longer carries
+                // a `set_writable_ms` field — its absence confirms A is in
+                // effect on this POC branch.
                 // TEMPORARY INSTRUMENTATION: one summary line per cache-path
                 // prepare. `cache_hit` true = existing entry reused;
                 // false = entry materialized fresh (still pays clonefile).
@@ -551,7 +554,6 @@ pub async fn prepare_action_inputs(
                         cache_hit,
                         remove_dir_ms = remove_dir_elapsed.as_millis() as u64,
                         get_or_create_ms = get_or_create_elapsed.as_millis() as u64,
-                        set_writable_ms = set_writable_elapsed.as_millis() as u64,
                         total_ms = prepare_started_at.elapsed().as_millis() as u64,
                         "prepare_action_inputs directory-cache phase timing",
                     );
