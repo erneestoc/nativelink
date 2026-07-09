@@ -25,16 +25,19 @@ use futures::future::BoxFuture;
 use futures::stream::TryStreamExt;
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_proto::build::bazel::remote::execution::v2::{
-    Directory as ProtoDirectory, DirectoryNode, FileNode, SymlinkNode,
+    Directory as ProtoDirectory, DirectoryNode, FileNode, GetTreeRequest, SymlinkNode,
 };
 use nativelink_store::ac_utils::get_and_decode_digest;
 use nativelink_store::cas_utils::is_zero_digest;
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::filesystem_store::{FileEntry, FilesystemStore};
+use nativelink_store::grpc_store::GrpcStore;
 use nativelink_util::background_spawn;
 use nativelink_util::common::DigestInfo;
+use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc, default_digest_hasher_func};
 use nativelink_util::fs_util::{CloneMethod, hardlink_directory_tree, set_dir_writable_recursive};
 use nativelink_util::store_trait::{StoreKey, StoreLike};
+use prost::Message;
 use tokio::fs;
 
 /// Maximum number of concurrently-polled node materializations (file
@@ -67,6 +70,8 @@ pub struct DirectoryCacheConfig {
     pub max_size_bytes: u64,
     /// Base directory for cache storage
     pub cache_root: PathBuf,
+    /// See `nativelink-config`'s `DirectoryCacheConfig::experimental_get_tree_prefetch`.
+    pub experimental_get_tree_prefetch: bool,
 }
 
 impl Default for DirectoryCacheConfig {
@@ -75,6 +80,7 @@ impl Default for DirectoryCacheConfig {
             max_entries: 1000,
             max_size_bytes: 10 * 1024 * 1024 * 1024, // 10 GB
             cache_root: std::env::temp_dir().join("nativelink_directory_cache"),
+            experimental_get_tree_prefetch: false,
         }
     }
 }
@@ -280,7 +286,9 @@ impl DirectoryCache {
                         "Failed to hardlink after construction"
                     );
                     // Construct directly at dest_path as a last resort.
-                    self.construct_directory(digest, dest_path).await?;
+                    let protos = Box::pin(self.prefetch_tree_protos(digest)).await;
+                    self.construct_directory(digest, dest_path, protos.as_ref())
+                        .await?;
                     return Ok(false);
                 }
             }
@@ -298,7 +306,10 @@ impl DirectoryCache {
         // with the CAS and every other in-flight action that hardlinked the
         // same blob — the inode-corruption bug PR #2347 fixed.
         let cache_path = self.get_cache_path(&digest);
-        let size = self.construct_directory(digest, &cache_path).await?;
+        let protos = Box::pin(self.prefetch_tree_protos(digest)).await;
+        let size = self
+            .construct_directory(digest, &cache_path, protos.as_ref())
+            .await?;
 
         // Insert into the cache. Only the in-memory map mutation runs under
         // the write lock: `evict_if_needed` selects victims and removes them
@@ -384,16 +395,93 @@ impl DirectoryCache {
     ///
     /// Each directory's final mode (0o755) is set at creation time, so no
     /// separate recursive permission pass is needed after construction.
+    /// Prefetches every `Directory` proto of `root`'s tree with a single
+    /// `GetTree` stream, keyed by each proto's re-computed digest (the
+    /// stream carries protos, not digests). Returns `None` — meaning
+    /// "use the per-level fetch path" — when the feature is disabled, the
+    /// slow tier is not a `GrpcStore`, or the stream fails; a `Some` map
+    /// may also be incomplete, which `construct_directory` tolerates by
+    /// fetching any missing proto individually. One fetch permit covers
+    /// the whole stream (it is one RPC).
+    async fn prefetch_tree_protos(
+        &self,
+        root: DigestInfo,
+    ) -> Option<HashMap<DigestInfo, ProtoDirectory>> {
+        if !self.config.experimental_get_tree_prefetch {
+            return None;
+        }
+        let grpc_store = self
+            .cas_store
+            .slow_store()
+            .downcast_ref::<GrpcStore>(None)?;
+        let digest_hasher = opentelemetry::Context::current()
+            .get::<DigestHasherFunc>()
+            .map_or_else(default_digest_hasher_func, |v| *v);
+        let result: Result<HashMap<DigestInfo, ProtoDirectory>, Error> = async {
+            let _permit = self.acquire_fetch_permit().await?;
+            let mut stream = grpc_store
+                .get_tree(tonic::Request::new(GetTreeRequest {
+                    instance_name: String::new(),
+                    root_digest: Some(root.into()),
+                    page_size: 0,
+                    page_token: String::new(),
+                    digest_function: digest_hasher.proto_digest_func().into(),
+                }))
+                .await
+                .err_tip(|| "in prefetch_tree_protos")?
+                .into_inner();
+            let mut protos = HashMap::new();
+            while let Some(response) = stream
+                .message()
+                .await
+                .map_err(Error::from)
+                .err_tip(|| "reading GetTree stream in prefetch_tree_protos")?
+            {
+                for directory in response.directories {
+                    // GetTree yields protos without digests; recompute with
+                    // the caller's digest function so lookups match the
+                    // digests embedded in parent directories.
+                    let encoded = directory.encode_to_vec();
+                    let mut hasher = digest_hasher.hasher();
+                    hasher.update(&encoded);
+                    protos.insert(hasher.finalize_digest(), directory);
+                }
+            }
+            Ok(protos)
+        }
+        .await;
+        match result {
+            Ok(protos) => {
+                trace!(?root, protos = protos.len(), "GetTree prefetch complete");
+                Some(protos)
+            }
+            Err(err) => {
+                debug!(
+                    ?err,
+                    ?root,
+                    "GetTree prefetch failed; using per-level fetches"
+                );
+                None
+            }
+        }
+    }
+
     fn construct_directory<'a>(
         &'a self,
         digest: DigestInfo,
         dest_path: &'a Path,
+        protos: Option<&'a HashMap<DigestInfo, ProtoDirectory>>,
     ) -> Pin<Box<dyn Future<Output = Result<u64, Error>> + Send + 'a>> {
         Box::pin(async move {
             debug!(?digest, ?dest_path, "Constructing directory");
 
-            // Fetch the Directory proto (permit held only for the fetch).
-            let directory: ProtoDirectory = {
+            // Use the prefetched proto when available; otherwise fetch it
+            // (permit held only for the fetch). A prefetch-map miss (e.g.
+            // an incomplete GetTree response) degrades to the fetch path.
+            let prefetched = protos.and_then(|map| map.get(&digest));
+            let directory: ProtoDirectory = if let Some(directory) = prefetched {
+                directory.clone()
+            } else {
                 let _permit = self.acquire_fetch_permit().await?;
                 get_and_decode_digest(self.cas_store.as_ref(), digest.into())
                     .await
@@ -430,7 +518,9 @@ impl DirectoryCache {
                 }));
             }
             for dir_node in &directory.directories {
-                node_futures.push(Box::pin(self.create_subdirectory(dest_path, dir_node)));
+                node_futures.push(Box::pin(
+                    self.create_subdirectory(dest_path, dir_node, protos),
+                ));
             }
             for symlink in &directory.symlinks {
                 node_futures.push(Box::pin(async move {
@@ -625,6 +715,7 @@ impl DirectoryCache {
         &self,
         parent: &Path,
         dir_node: &DirectoryNode,
+        protos: Option<&HashMap<DigestInfo, ProtoDirectory>>,
     ) -> Result<u64, Error> {
         let dir_path = parent.join(&dir_node.name);
         let digest =
@@ -636,7 +727,7 @@ impl DirectoryCache {
         trace!(?dir_path, ?digest, "Creating subdirectory");
 
         // Recursively construct subdirectory
-        self.construct_directory(digest, &dir_path).await
+        self.construct_directory(digest, &dir_path, protos).await
     }
 
     /// Creates a symlink from a `SymlinkNode`
@@ -908,6 +999,7 @@ mod tests {
             max_entries: 10,
             max_size_bytes: 1024 * 1024,
             cache_root,
+            experimental_get_tree_prefetch: false,
         };
 
         let cache = DirectoryCache::new(config, store).await?;
@@ -996,6 +1088,7 @@ mod tests {
             max_entries: 10,
             max_size_bytes: 1024 * 1024,
             cache_root,
+            experimental_get_tree_prefetch: false,
         };
         let cache = DirectoryCache::new(config, store).await?;
 
@@ -1234,6 +1327,7 @@ mod tests {
             max_entries: 10,
             max_size_bytes: 1024 * 1024,
             cache_root,
+            experimental_get_tree_prefetch: false,
         };
         let cache = DirectoryCache::new(config, store).await?;
 
@@ -1300,6 +1394,7 @@ mod tests {
             max_entries: 10,
             max_size_bytes: 1024 * 1024,
             cache_root,
+            experimental_get_tree_prefetch: false,
         };
         let cache = DirectoryCache::new(config, store).await?;
 
@@ -1378,6 +1473,7 @@ mod tests {
             max_entries: 10,
             max_size_bytes: 1024 * 1024,
             cache_root,
+            experimental_get_tree_prefetch: false,
         };
         let cache = DirectoryCache::new(config, cas_store).await?;
 
@@ -1428,6 +1524,7 @@ mod tests {
             max_entries: 10,
             max_size_bytes: 1024 * 1024,
             cache_root,
+            experimental_get_tree_prefetch: false,
         };
         let cache = DirectoryCache::new(config, store).await?;
 
@@ -1498,6 +1595,7 @@ mod tests {
             max_entries: 10,
             max_size_bytes: 1024 * 1024,
             cache_root,
+            experimental_get_tree_prefetch: false,
         };
         let cache = DirectoryCache::new(config, cas_store).await?;
 
@@ -1554,6 +1652,7 @@ mod tests {
             max_entries: 10,
             max_size_bytes: 1024 * 1024,
             cache_root,
+            experimental_get_tree_prefetch: false,
         };
         let cache = DirectoryCache::new(config, cas_store).await?;
         let dest = temp_dir.path().join("dest");
@@ -1593,6 +1692,7 @@ mod tests {
             max_entries: 10,
             max_size_bytes: 1024 * 1024,
             cache_root,
+            experimental_get_tree_prefetch: false,
         };
         let cache = Arc::new(DirectoryCache::new(config, store).await?);
 
@@ -1633,6 +1733,27 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    #[nativelink_test]
+    async fn get_tree_prefetch_falls_back_without_grpc_store() -> Result<(), Error> {
+        // With the flag on but a non-grpc slow tier, prefetch must return
+        // None and construction must fall back to per-level fetches with
+        // identical results.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_root = temp_dir.path().join("cache");
+        let (store, dir_digest) = setup_test_store(&temp_dir).await;
+        let config = DirectoryCacheConfig {
+            max_entries: 10,
+            max_size_bytes: 1024 * 1024,
+            cache_root,
+            experimental_get_tree_prefetch: true,
+        };
+        let cache = DirectoryCache::new(config, store).await?;
+        let dest = temp_dir.path().join("dest");
+        assert!(!cache.get_or_create(dir_digest, &dest).await?);
+        assert!(dest.join("test.txt").exists());
         Ok(())
     }
 }
