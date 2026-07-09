@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::stream::{StreamExt, TryStreamExt};
 use futures::{Future, TryFutureExt};
-use nativelink_config::stores::FilesystemSpec;
+use nativelink_config::stores::{FilesystemSpec, FilesystemSyncPolicy};
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_metric::MetricsComponent;
 use nativelink_util::background_spawn;
@@ -844,6 +844,8 @@ pub struct FilesystemStore<Fe: FileEntry = FileEntryImpl> {
     rename_fn: fn(&OsStr, &OsStr) -> Result<(), std::io::Error>,
     /// Limits concurrent write operations to prevent disk I/O saturation.
     write_semaphore: Option<Semaphore>,
+    /// See [`FilesystemSpec::sync_policy`].
+    sync_policy: FilesystemSyncPolicy,
     /// Per-digest single-flight locks guarding creation of the executable
     /// variant in `{content_path}.exec`, so each variant's writable fd is
     /// opened exactly once. The outer lock is sync and only ever held to
@@ -940,6 +942,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             weak_self: weak_self.clone(),
             rename_fn,
             write_semaphore,
+            sync_policy: spec.sync_policy,
             #[cfg(unix)]
             executable_locks: std::sync::Mutex::new(HashMap::new()),
         }))
@@ -1078,6 +1081,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         let mut temp_owned = variant_path.to_os_string();
         temp_owned.push(".tmp");
         let rename_fn = self.rename_fn;
+        let sync_policy = self.sync_policy;
 
         // All of this is blocking std::fs; run it off the async runtime. The
         // writable fd opened by `copy` is fully closed before the `rename`
@@ -1097,12 +1101,29 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
                             "executable-variant chmod 0o555 failed: {e:?}"
                         )
                     })?;
-                // Reopen read-only purely to fsync the bytes durable before publish.
-                let f = std::fs::File::open(&temp_owned)
-                    .map_err(|e| make_err!(Code::Internal, "executable-variant reopen: {e:?}"))?;
-                f.sync_all()
+                // Reopen read-only purely to flush the bytes durable before
+                // publish, honoring the configured sync policy.
+                if sync_policy != FilesystemSyncPolicy::None {
+                    let f = std::fs::File::open(&temp_owned).map_err(|e| {
+                        make_err!(Code::Internal, "executable-variant reopen: {e:?}")
+                    })?;
+                    match sync_policy {
+                        FilesystemSyncPolicy::Full => f.sync_all(),
+                        FilesystemSyncPolicy::Data => f.sync_data(),
+                        // Already on a blocking thread; call fsync(2) inline.
+                        FilesystemSyncPolicy::Fsync => {
+                            use std::os::fd::AsRawFd;
+                            if unsafe { libc::fsync(f.as_raw_fd()) } == 0 {
+                                Ok(())
+                            } else {
+                                Err(std::io::Error::last_os_error())
+                            }
+                        }
+                        FilesystemSyncPolicy::None => Ok(()),
+                    }
                     .map_err(|e| make_err!(Code::Internal, "executable-variant fsync: {e:?}"))?;
-                drop(f);
+                    drop(f);
+                }
                 rename_fn(temp_owned.as_os_str(), variant_owned.as_os_str()).map_err(|e| {
                     make_err!(Code::Internal, "executable-variant rename failed: {e:?}")
                 })?;
@@ -1173,11 +1194,9 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             .flush()
             .await
             .err_tip(|| "Failed to flush in filesystem store")?;
-        temp_file
-            .as_ref()
-            .sync_all()
+        self.sync_file(&temp_file)
             .await
-            .err_tip(|| "Failed to sync_data in filesystem store")?;
+            .err_tip(|| "Failed to sync in filesystem store")?;
 
         drop(permit);
 
@@ -1298,6 +1317,37 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         })
         .await
         .err_tip(|| "Failed to create spawn in filesystem store update_file")?
+    }
+
+    /// Flushes `file` according to the configured
+    /// [`FilesystemSpec::sync_policy`](nativelink_config::stores::FilesystemSpec::sync_policy).
+    async fn sync_file(&self, file: &FileSlot) -> Result<(), Error> {
+        match self.sync_policy {
+            FilesystemSyncPolicy::Full => file.as_ref().sync_all().await.map_err(Into::into),
+            FilesystemSyncPolicy::Data => file.as_ref().sync_data().await.map_err(Into::into),
+            // `File::sync_all`/`sync_data` map to F_FULLFSYNC/F_BARRIERFSYNC
+            // on macOS; plain fsync(2) (data handed to the device, no cache
+            // flush or barrier) is only reachable through libc.
+            #[cfg(unix)]
+            FilesystemSyncPolicy::Fsync => {
+                use std::os::fd::AsRawFd;
+                let fd = file.as_ref().as_raw_fd();
+                // The borrow of `file` is held across the await below, so
+                // the fd stays open until fsync returns.
+                spawn_blocking!("filesystem_store_fsync", move || {
+                    if unsafe { libc::fsync(fd) } == 0 {
+                        Ok(())
+                    } else {
+                        Err(Error::from(std::io::Error::last_os_error()))
+                    }
+                })
+                .await
+                .err_tip(|| "Failed to join fsync task in filesystem store")?
+            }
+            #[cfg(not(unix))]
+            FilesystemSyncPolicy::Fsync => file.as_ref().sync_all().await.map_err(Into::into),
+            FilesystemSyncPolicy::None => Ok(()),
+        }
     }
 
     pub fn get_eviction_snapshot(&self) -> EvictionSnapshot {
@@ -1438,11 +1488,9 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             .flush()
             .await
             .err_tip(|| "Failed to flush in filesystem store update_oneshot")?;
-        temp_file
-            .as_ref()
-            .sync_all()
+        self.sync_file(&temp_file)
             .await
-            .err_tip(|| "Failed to sync_data in filesystem store update_oneshot")?;
+            .err_tip(|| "Failed to sync in filesystem store update_oneshot")?;
 
         drop(_permit);
 

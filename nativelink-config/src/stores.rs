@@ -748,6 +748,62 @@ pub struct FilesystemSpec {
     /// Default: unlimited
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
     pub max_concurrent_writes: usize,
+
+    /// How durably each blob is flushed to persistent storage before it is
+    /// published (renamed) into the content directory.
+    ///
+    /// The flush cost is paid once per uploaded blob, so on workloads with
+    /// many small files it dominates end-to-end materialization time. On
+    /// macOS, `full` issues `F_FULLFSYNC` (a full device-cache flush) per
+    /// blob, which costs multiple milliseconds even on fast `NVMe` drives and
+    /// is significantly more expensive inside virtual machines.
+    ///
+    /// Regardless of this setting, a *process* crash cannot corrupt the
+    /// store: published blobs live in the OS page cache and the temp-file +
+    /// rename protocol keeps partially-written blobs out of the content
+    /// directory. The stronger policies only add protection against
+    /// machine-level failures, where the weaker ones can leave a truncated
+    /// blob in the content directory that the startup scan would then trust:
+    /// `fsync` still survives a kernel panic (data was already handed to the
+    /// storage device) but can lose the device's volatile cache on a power
+    /// cut, while `none` is exposed to both.
+    ///
+    /// Measured on a 4,400-tiny-file input tree on macOS/APFS, `fsync` and
+    /// `none` are both ~6.6x faster end-to-end than `full` (which costs
+    /// ~3ms per blob), and `data` is not measurably better than `full`.
+    /// On Linux the gap is far smaller (journal group commit amortizes
+    /// concurrent flushes), so this knob mainly matters on macOS.
+    ///
+    /// When this store is a re-fetchable cache (for example the fast tier
+    /// of a worker's CAS), `fsync` (or `none`) is generally safe.
+    ///
+    /// Default: `full` (the historical behavior).
+    #[serde(default)]
+    pub sync_policy: FilesystemSyncPolicy,
+}
+
+/// See [`FilesystemSpec::sync_policy`].
+#[derive(Serialize, Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
+pub enum FilesystemSyncPolicy {
+    /// Flush file data and metadata to persistent storage
+    /// (`File::sync_all`; `fcntl(F_FULLFSYNC)` on macOS).
+    #[default]
+    Full,
+    /// Flush file data but not all metadata, and do not force the device
+    /// cache to drain (`File::sync_data`; `fdatasync` on Linux,
+    /// `fcntl(F_BARRIERFSYNC)` on macOS).
+    Data,
+    /// The platform's plain `fsync(2)`. On Linux this is equivalent to
+    /// `full`. On macOS it hands the data to the storage device WITHOUT
+    /// forcing a device-cache flush or ordering barrier — it survives
+    /// kernel panics, but a power cut can lose whatever still sits in the
+    /// drive's volatile cache. On non-unix platforms falls back to `full`.
+    Fsync,
+    /// Do not flush at all. Safe against process crashes; after a power
+    /// loss or kernel panic the store may contain truncated blobs.
+    None,
 }
 
 // NetApp ONTAP S3 Spec

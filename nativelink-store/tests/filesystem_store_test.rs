@@ -1982,3 +1982,70 @@ async fn unref_does_not_orphan_content_file_when_temp_dir_missing() -> Result<()
 
     Ok(())
 }
+
+// The `data` and `none` sync policies only change how (whether) blobs are
+// flushed before publish; every read/write contract must be identical to
+// the default `full` policy. Round-trips both the oneshot and streaming
+// upload paths under each policy and confirms the blobs survive a store
+// restart (process-crash-equivalent: the page cache persists).
+#[nativelink_test]
+async fn sync_policy_round_trip_test() -> Result<(), Error> {
+    for sync_policy in [
+        nativelink_config::stores::FilesystemSyncPolicy::Full,
+        nativelink_config::stores::FilesystemSyncPolicy::Data,
+        nativelink_config::stores::FilesystemSyncPolicy::Fsync,
+        nativelink_config::stores::FilesystemSyncPolicy::None,
+    ] {
+        let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+        let streamed_digest = DigestInfo::try_new(HASH2, VALUE2.len())?;
+        let content_path = make_temp_path(&format!("content_path_{sync_policy:?}"));
+        let temp_path = make_temp_path(&format!("temp_path_{sync_policy:?}"));
+        let spec = FilesystemSpec {
+            content_path: content_path.clone(),
+            temp_path: temp_path.clone(),
+            eviction_policy: None,
+            sync_policy,
+            block_size: 1,
+            ..Default::default()
+        };
+        {
+            let store = Store::new(FilesystemStore::<FileEntryImpl>::new(&spec).await?);
+            store.update_oneshot(digest, VALUE1.into()).await?;
+
+            let (mut tx, rx) = make_buf_channel_pair();
+            tx.send(VALUE2.into()).await?;
+            tx.send_eof()?;
+            store
+                .update(
+                    streamed_digest,
+                    rx,
+                    UploadSizeInfo::ExactSize(VALUE2.len() as u64),
+                )
+                .await?;
+
+            assert_eq!(
+                store.get_part_unchunked(digest, 0, None).await?,
+                VALUE1.as_bytes(),
+                "oneshot round trip failed for {sync_policy:?}"
+            );
+            assert_eq!(
+                store.get_part_unchunked(streamed_digest, 0, None).await?,
+                VALUE2.as_bytes(),
+                "streamed round trip failed for {sync_policy:?}"
+            );
+        }
+        // A fresh store over the same paths must find the published blobs.
+        let store = Store::new(FilesystemStore::<FileEntryImpl>::new(&spec).await?);
+        assert_eq!(
+            store.has(digest).await?,
+            Some(VALUE1.len() as u64),
+            "blob missing after restart for {sync_policy:?}"
+        );
+        assert_eq!(
+            store.get_part_unchunked(streamed_digest, 0, None).await?,
+            VALUE2.as_bytes(),
+            "streamed blob unreadable after restart for {sync_policy:?}"
+        );
+    }
+    Ok(())
+}

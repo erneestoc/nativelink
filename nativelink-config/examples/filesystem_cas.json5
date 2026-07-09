@@ -19,6 +19,16 @@
               // 2gb.
               max_bytes: 2000000000,
             },
+            // How durably each blob is flushed before being published.
+            // The default ("full") maps to File::sync_all, which on macOS
+            // issues a full device-cache flush (F_FULLFSYNC) per blob and
+            // dominates many-tiny-file workloads. When this store is a
+            // re-fetchable cache (e.g. a worker's fast tier), "fsync"
+            // (plain fsync(2): survives kernel panics, ~6.6x faster on
+            // macOS) or "none" (fastest, truncated blobs possible after
+            // power loss / kernel panic — never after a process crash)
+            // are usually the right choice.
+            sync_policy: "full",
           },
         },
       },

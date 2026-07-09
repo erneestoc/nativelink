@@ -111,7 +111,11 @@ rust_library(
         "@crates//:uuid",
         "@crates//:webpki-roots",
         "@crates//:wincode",
-    ],
+    ] + select({
+        "@platforms//os:linux": ["@crates//:libc"],
+        "@platforms//os:macos": ["@crates//:libc"],
+        "//conditions:default": [],
+    }),
 )
 
 rust_test_suite(
