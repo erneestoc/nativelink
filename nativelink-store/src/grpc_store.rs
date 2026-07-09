@@ -15,10 +15,11 @@
 use core::pin::Pin;
 use core::time::Duration;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use futures::stream::{FuturesUnordered, unfold};
 use futures::{Future, Stream, StreamExt, TryFutureExt, TryStreamExt, future};
 use nativelink_config::stores::GrpcSpec;
@@ -833,6 +834,134 @@ impl StoreDriver for GrpcStore {
         Ok(())
     }
 
+    async fn get_part_many(
+        self: Pin<&Self>,
+        keys: &[StoreKey<'_>],
+    ) -> Result<Vec<Result<Bytes, Error>>, Error> {
+        // Total bytes of blob data per BatchReadBlobs request, plus a fixed
+        // per-entry charge for proto/framing overhead. Callers are expected
+        // to route only small blobs here.
+        const MAX_BATCH_READ_BYTES: u64 = 3 * 1024 * 1024;
+        const PER_ENTRY_OVERHEAD_BYTES: u64 = 256;
+
+        if matches!(self.store_type, nativelink_config::stores::StoreType::Ac) {
+            // AC entries are not CAS blobs; read them one by one.
+            let mut results = Vec::with_capacity(keys.len());
+            for key in keys {
+                results.push(self.get_part_unchunked(key.borrow(), 0, None).await);
+            }
+            return Ok(results);
+        }
+
+        // Group indices by unique digest so duplicate keys cost one wire
+        // entry and servers that dedup responses cannot starve a caller.
+        let mut results: Vec<Option<Result<Bytes, Error>>> = Vec::with_capacity(keys.len());
+        results.resize_with(keys.len(), || None);
+        let mut unique_digests: Vec<DigestInfo> = Vec::with_capacity(keys.len());
+        let mut indices_by_digest: HashMap<DigestInfo, Vec<usize>> =
+            HashMap::with_capacity(keys.len());
+        for (index, key) in keys.iter().enumerate() {
+            let digest = key.borrow().into_digest();
+            let indices = indices_by_digest.entry(digest).or_default();
+            if indices.is_empty() {
+                unique_digests.push(digest);
+            }
+            indices.push(index);
+        }
+
+        let digest_function = Context::current()
+            .get::<DigestHasherFunc>()
+            .map_or_else(default_digest_hasher_func, |v| *v)
+            .proto_digest_func();
+
+        let mut chunk: Vec<DigestInfo> = Vec::new();
+        let mut chunk_bytes = 0u64;
+        let mut chunks: Vec<Vec<DigestInfo>> = Vec::new();
+        for digest in unique_digests {
+            let entry_cost = digest.size_bytes() + PER_ENTRY_OVERHEAD_BYTES;
+            if !chunk.is_empty() && chunk_bytes + entry_cost > MAX_BATCH_READ_BYTES {
+                chunks.push(core::mem::take(&mut chunk));
+                chunk_bytes = 0;
+            }
+            chunk.push(digest);
+            chunk_bytes += entry_cost;
+        }
+        if !chunk.is_empty() {
+            chunks.push(chunk);
+        }
+
+        for chunk in chunks {
+            let request = BatchReadBlobsRequest {
+                instance_name: self.instance_name.clone(),
+                digests: chunk.iter().map(|digest| (*digest).into()).collect(),
+                // Identity only: this path trades decompression for
+                // simplicity; large blobs never come through here.
+                acceptable_compressors: Vec::new(),
+                digest_function: digest_function.into(),
+            };
+            let response = self
+                .batch_read_blobs(Request::new(request))
+                .await
+                .err_tip(|| "in GrpcStore::get_part_many")?
+                .into_inner();
+
+            let mut by_digest: HashMap<DigestInfo, Result<Bytes, Error>> =
+                HashMap::with_capacity(response.responses.len());
+            for entry in response.responses {
+                let Some(digest_proto) = entry.digest else {
+                    continue;
+                };
+                let digest = DigestInfo::try_from(digest_proto)
+                    .err_tip(|| "Invalid digest in BatchReadBlobs response")?;
+                let entry_result = match entry.status {
+                    Some(status) if status.code != 0 => Err(Error::from(status)
+                        .append(format!("in BatchReadBlobs response for {digest}"))),
+                    _ if entry.compressor != 0 => Err(make_err!(
+                        Code::Internal,
+                        "BatchReadBlobs returned non-identity compressor {} for {digest}",
+                        entry.compressor
+                    )),
+                    _ if entry.data.len() as u64 != digest.size_bytes() => Err(make_err!(
+                        Code::Internal,
+                        "BatchReadBlobs returned {} bytes for {digest}, expected {}",
+                        entry.data.len(),
+                        digest.size_bytes()
+                    )),
+                    _ => Ok(entry.data),
+                };
+                by_digest.insert(digest, entry_result);
+            }
+            for digest in chunk {
+                let entry_result = by_digest.remove(&digest).unwrap_or_else(|| {
+                    Err(make_err!(
+                        Code::NotFound,
+                        "BatchReadBlobs response omitted {digest}"
+                    ))
+                });
+                if let Some(indices) = indices_by_digest.get(&digest) {
+                    for &index in indices {
+                        results[index] = Some(match &entry_result {
+                            Ok(data) => Ok(data.clone()),
+                            Err(err) => Err(err.clone()),
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(results
+            .into_iter()
+            .map(|result| {
+                result.unwrap_or_else(|| {
+                    Err(make_err!(
+                        Code::Internal,
+                        "get_part_many result missing for key"
+                    ))
+                })
+            })
+            .collect())
+    }
+
     async fn update(
         self: Pin<&Self>,
         key: StoreKey<'_>,
@@ -1013,7 +1142,7 @@ impl StoreDriver for GrpcStore {
                 loop {
                     let data = match stream.next().await {
                         // Create an empty response to represent EOF.
-                        None => bytes::Bytes::new(),
+                        None => Bytes::new(),
                         Some(Ok(message)) => message.data,
                         Some(Err(status)) => {
                             return Some((

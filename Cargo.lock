@@ -3329,6 +3329,7 @@ dependencies = [
  "nativelink-macro",
  "nativelink-metric",
  "nativelink-proto",
+ "nativelink-service",
  "nativelink-store",
  "nativelink-util",
  "opentelemetry",

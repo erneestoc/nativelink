@@ -18,7 +18,7 @@ use core::ops::Range;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::sync::{Arc, Weak};
 
@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
 use futures::{FutureExt, join, try_join};
 use nativelink_config::stores::{FastSlowSpec, StoreDirection};
-use nativelink_error::{Code, Error, ErrorContext, ResultExt, make_err};
+use nativelink_error::{Code, Error, ErrorContext, ResultExt, error_if, make_err};
 use nativelink_metric::MetricsComponent;
 use nativelink_util::buf_channel::{
     DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair,
@@ -396,6 +396,84 @@ impl FastSlowStore {
             })
             .await
             .err_tip(|| "Failed to populate()")
+    }
+
+    /// Batch variant of `populate_fast_store`: ensures every key is present
+    /// in the fast store, fetching the missing ones from the slow store with
+    /// one `get_part_many` and publishing them with one `update_many`.
+    ///
+    /// Callers must only pass keys for small objects (the fetched contents
+    /// are held in memory all at once) and should bound the total bytes per
+    /// call. Any per-key failure fails the whole call; callers with per-key
+    /// fallback paths should retry individual keys through the per-key APIs.
+    ///
+    /// Unlike `populate_fast_store` this does not deduplicate concurrent
+    /// fetches of the same key across callers; a duplicate fetch publishes an
+    /// identical blob, which the fast store deduplicates on insert.
+    pub async fn populate_many(&self, keys: &[StoreKey<'_>]) -> Result<(), Error> {
+        let mut unique_keys = Vec::with_capacity(keys.len());
+        {
+            let mut seen = HashSet::with_capacity(keys.len());
+            for key in keys {
+                let owned = key.borrow().into_owned();
+                if seen.insert(owned.clone()) {
+                    unique_keys.push(owned);
+                }
+            }
+        }
+        let mut results = vec![None; unique_keys.len()];
+        self.fast_store
+            .has_with_results(&unique_keys, &mut results)
+            .await
+            .err_tip(|| "While querying fast store in populate_many")?;
+        let missing: Vec<StoreKey<'static>> = unique_keys
+            .into_iter()
+            .zip(results)
+            .filter_map(|(key, result)| result.is_none().then_some(key))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        // If the fast store is noop or read only or update only then this is an error.
+        if self
+            .fast_store
+            .inner_store::<StoreKey<'_>>(None)
+            .optimized_for(StoreOptimizations::NoopUpdates)
+            || self.fast_direction == StoreDirection::ReadOnly
+            || self.fast_direction == StoreDirection::Update
+        {
+            return Err(make_err!(
+                Code::Internal,
+                "Attempt to populate fast store that is read only or noop"
+            ));
+        }
+
+        let fetched = self
+            .slow_store
+            .get_part_many(&missing)
+            .await
+            .err_tip(|| "While batch reading from slow store in populate_many")?;
+        error_if!(
+            fetched.len() != missing.len(),
+            "get_part_many returned {} results for {} keys in populate_many",
+            fetched.len(),
+            missing.len()
+        );
+        let mut items = Vec::with_capacity(missing.len());
+        for (key, result) in missing.into_iter().zip(fetched) {
+            let data = result.err_tip(|| {
+                format!(
+                    "While fetching {} from slow store in populate_many",
+                    key.as_str()
+                )
+            })?;
+            items.push((key, data));
+        }
+        self.fast_store
+            .update_many(items)
+            .await
+            .err_tip(|| "While writing batch into fast store in populate_many")
     }
 
     /// Returns the range of bytes that should be sent given a slice bounds

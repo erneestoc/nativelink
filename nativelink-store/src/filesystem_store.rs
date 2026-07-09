@@ -19,7 +19,10 @@ use core::time::Duration;
 use std::borrow::Cow;
 #[cfg(unix)]
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::SystemTime;
 
@@ -374,6 +377,31 @@ fn make_temp_digest(mut digest: DigestInfo) -> DigestInfo {
 
 pub fn make_temp_key(key: &StoreKey) -> StoreKey<'static> {
     StoreKey::Digest(make_temp_digest(key.borrow().into_digest()))
+}
+
+// TODO(prototype-only): benchmark A/B switch, remove before PR.
+// NL_FSYNC=none|barrier|full (default full = current behavior).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FsyncMode {
+    Full,
+    Barrier,
+    None,
+}
+
+fn fsync_mode() -> FsyncMode {
+    static MODE: std::sync::LazyLock<FsyncMode> =
+        std::sync::LazyLock::new(|| match std::env::var("NL_FSYNC").as_deref() {
+            Ok("none") => FsyncMode::None,
+            Ok("barrier") => FsyncMode::Barrier,
+            _ => {
+                if std::env::var_os("NL_NO_FSYNC").is_some() {
+                    FsyncMode::None
+                } else {
+                    FsyncMode::Full
+                }
+            }
+        });
+    *MODE
 }
 
 impl LenEntry for FileEntryImpl {
@@ -1173,11 +1201,19 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             .flush()
             .await
             .err_tip(|| "Failed to flush in filesystem store")?;
-        temp_file
-            .as_ref()
-            .sync_all()
-            .await
-            .err_tip(|| "Failed to sync_data in filesystem store")?;
+        match fsync_mode() {
+            FsyncMode::Full => temp_file
+                .as_ref()
+                .sync_all()
+                .await
+                .err_tip(|| "Failed to sync_data in filesystem store")?,
+            FsyncMode::Barrier => temp_file
+                .as_ref()
+                .sync_data()
+                .await
+                .err_tip(|| "Failed to sync_data in filesystem store")?,
+            FsyncMode::None => {}
+        }
 
         drop(permit);
 
@@ -1298,6 +1334,140 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         })
         .await
         .err_tip(|| "Failed to create spawn in filesystem store update_file")?
+    }
+
+    /// Batch variant of `emplace_file`: one background task publishes every
+    /// entry (duplicate check, map insert, rename under the entry write lock)
+    /// instead of paying a task spawn plus per-file lock round trips for each
+    /// file. The per-entry locking discipline is identical to `emplace_file`;
+    /// the read-only chmod already happened on the temp file's open fd in
+    /// `update_many`, so no separate permission pass is needed here.
+    async fn emplace_files_batch(
+        &self,
+        entries: Vec<(StoreKey<'static>, Arc<Fe>)>,
+    ) -> Result<(), Error> {
+        let evicting_map = self.evicting_map.clone();
+        let rename_fn = self.rename_fn;
+
+        // We need to guarantee that this will get to the end even if the
+        // parent future is dropped.
+        // See: https://github.com/TraceMachina/nativelink/issues/495
+        background_spawn!("filesystem_store_emplace_files_batch", async move {
+            let mut to_publish = Vec::with_capacity(entries.len());
+            for (key, entry) in entries {
+                // Identical duplicates are dropped, exactly like
+                // `emplace_file` (the entry drop deletes its temp file).
+                if check_duplicate_files(&evicting_map, &key, &entry).await? {
+                    continue;
+                }
+                to_publish.push((key, entry));
+            }
+            let inserts: Vec<_> = to_publish
+                .iter()
+                .map(|(key, entry)| (key.borrow().into_owned().into(), entry.clone()))
+                .collect();
+            evicting_map.insert_many(inserts).await;
+
+            let mut batch_result: Result<(), Error> = Ok(());
+            for (key, entry) in to_publish {
+                // See `emplace_file` for the full breakdown of why this
+                // insert-then-rename-under-write-lock sequence is safe.
+                let mut encoded_file_path = entry.get_encoded_file_path().write().await;
+                if evicting_map.get(&key).await.is_none() {
+                    info!(%key, "Got eviction while emplacing, dropping");
+                    continue;
+                }
+                let final_path = get_file_path_raw(
+                    &PathType::Content,
+                    encoded_file_path.shared_context.as_ref(),
+                    &key,
+                );
+                let from_path = encoded_file_path.get_file_path();
+                let rename_result = (rename_fn)(&from_path, &final_path).err_tip(|| {
+                    format!(
+                        "Failed to rename temp file to final path {}",
+                        final_path.display()
+                    )
+                });
+                if let Err(err) = rename_result {
+                    error!(?err, ?from_path, ?final_path, "Failed to rename file",);
+                    // Drop the lock before `remove_if` to avoid the `unref()`
+                    // write-lock deadlock described in `emplace_file`.
+                    drop(encoded_file_path);
+                    evicting_map
+                        .remove_if(&key, |map_entry| Arc::<Fe>::ptr_eq(map_entry, &entry))
+                        .await;
+                    batch_result = batch_result.merge(Err(err));
+                    continue;
+                }
+                encoded_file_path.path_type = PathType::Content;
+                encoded_file_path.key = key;
+            }
+            batch_result
+        })
+        .await
+        .err_tip(|| "Failed to create spawn in filesystem store emplace_files_batch")?
+    }
+
+    /// Hardlinks the CAS blobs for `links` (digest → destination path) in one
+    /// blocking task, returning per-item results in input order. Bumps each
+    /// digest's LRU position first; digests not present in the map return
+    /// `NotFound` without touching the filesystem.
+    ///
+    /// Unlike `get_file_entry_for_digest` + `get_file_path_locked`, this does
+    /// NOT hold the entry lock across the link, so a blob evicted (or still
+    /// being published) between the presence check and the `hard_link` shows
+    /// up as a per-item `NotFound`. Callers must treat any per-item error as
+    /// "fall back to the per-file fetch path", which re-populates and links
+    /// under the entry lock.
+    pub async fn hardlink_many(
+        &self,
+        links: Vec<(DigestInfo, PathBuf)>,
+    ) -> Result<Vec<Result<(), Error>>, Error> {
+        let own_keys = links
+            .iter()
+            .map(|(digest, _)| StoreKey::Digest(*digest))
+            .collect::<Vec<_>>();
+        let mut sizes = vec![None; own_keys.len()];
+        self.evicting_map
+            .sizes_for_keys(own_keys.iter(), &mut sizes, false /* peek */)
+            .await;
+
+        let shared_context = self.shared_context.clone();
+        // One open-file permit and one blocking task for the whole batch:
+        // hard_link is a metadata-only operation, no fds are held open.
+        fs::call_with_permit(move |_permit| {
+            let mut results = Vec::with_capacity(links.len());
+            for ((digest, dest), size) in links.into_iter().zip(sizes) {
+                if size.is_none() {
+                    results.push(Err(make_err!(
+                        Code::NotFound,
+                        "{digest} not found in filesystem store during hardlink_many"
+                    )));
+                    continue;
+                }
+                let src = to_full_path_from_key(
+                    &shared_context.content_path,
+                    &StoreKey::Digest(digest),
+                );
+                results.push(std::fs::hard_link(&src, &dest).map_err(|err| {
+                    if err.kind() == std::io::ErrorKind::NotFound {
+                        make_err!(
+                            Code::NotFound,
+                            "Hardlink source missing for {digest} (likely evicted): {err:?}"
+                        )
+                    } else {
+                        make_err!(
+                            Code::Internal,
+                            "Failed to hardlink {digest} to {}: {err:?}",
+                            dest.display()
+                        )
+                    }
+                }));
+            }
+            Ok(results)
+        })
+        .await
     }
 
     pub fn get_eviction_snapshot(&self) -> EvictionSnapshot {
@@ -1438,11 +1608,19 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             .flush()
             .await
             .err_tip(|| "Failed to flush in filesystem store update_oneshot")?;
-        temp_file
-            .as_ref()
-            .sync_all()
-            .await
-            .err_tip(|| "Failed to sync_data in filesystem store update_oneshot")?;
+        match fsync_mode() {
+            FsyncMode::Full => temp_file
+                .as_ref()
+                .sync_all()
+                .await
+                .err_tip(|| "Failed to sync_data in filesystem store update_oneshot")?,
+            FsyncMode::Barrier => temp_file
+                .as_ref()
+                .sync_data()
+                .await
+                .err_tip(|| "Failed to sync_data in filesystem store update_oneshot")?,
+            FsyncMode::None => {}
+        }
 
         drop(_permit);
 
@@ -1451,6 +1629,104 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
 
         *entry.data_size_mut() = data.len() as u64;
         self.emplace_file(key.into_owned(), Arc::new(entry)).await
+    }
+
+    async fn update_many(
+        self: Pin<&Self>,
+        items: Vec<(StoreKey<'static>, Bytes)>,
+    ) -> Result<(), Error> {
+        // Skip zero digests (assumed to exist) and duplicate keys (CAS
+        // contents for the same key are identical; publishing one is enough).
+        let mut seen = HashSet::with_capacity(items.len());
+        let mut batch = Vec::with_capacity(items.len());
+        for (key, data) in items {
+            if is_zero_digest(key.borrow()) {
+                continue;
+            }
+            if !seen.insert(key.borrow().into_owned()) {
+                continue;
+            }
+            batch.push((key, data));
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        let _write_permit = if let Some(sem) = &self.write_semaphore {
+            Some(sem.acquire().await.map_err(|err| {
+                Error::from_std_err(Code::Internal, &err).append("Write semaphore closed")
+            })?)
+        } else {
+            None
+        };
+
+        // One open-file permit and ONE blocking task for the whole batch:
+        // each temp file is created, written, chmod'd read-only, fsynced and
+        // closed strictly in sequence, so at most one fd is open at a time.
+        // This is the whole point of the batch path — the per-file
+        // update_oneshot flow pays a semaphore acquire + blocking-pool
+        // handoff for every one of create/write/flush/sync/chmod/rename.
+        let shared_context = self.shared_context.clone();
+        let written = fs::call_with_permit(move |_permit| {
+            let mut written: Vec<(StoreKey<'static>, StoreKey<'static>, u64)> =
+                Vec::with_capacity(batch.len());
+            for (key, data) in batch {
+                let temp_key = make_temp_key(&key);
+                let temp_path = to_full_path_from_key(&shared_context.temp_path, &temp_key);
+                let write_result = (|| -> std::io::Result<()> {
+                    let mut file = std::fs::File::create(&temp_path)?;
+                    file.write_all(&data)?;
+                    // Lock the blob down as read-only before it is published
+                    // so every hardlink of it inherits an immutable inode —
+                    // same contract as `emplace_file`.
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        file.set_permissions(std::fs::Permissions::from_mode(0o444))?;
+                    }
+                    match fsync_mode() {
+                        FsyncMode::Full => file.sync_all(),
+                        FsyncMode::Barrier => file.sync_data(),
+                        FsyncMode::None => Ok(()),
+                    }
+                })();
+                if let Err(err) = write_result {
+                    // No FileEntry owns these temp files yet, so clean them
+                    // up here; the startup sweep would otherwise only get
+                    // them on the next restart.
+                    drop(std::fs::remove_file(&temp_path));
+                    for (_, prev_temp_key, _) in &written {
+                        drop(std::fs::remove_file(to_full_path_from_key(
+                            &shared_context.temp_path,
+                            prev_temp_key,
+                        )));
+                    }
+                    return Err(make_err!(
+                        Code::Internal,
+                        "Failed to write temp file {} in update_many: {err:?}",
+                        temp_path.display()
+                    ));
+                }
+                written.push((key, temp_key, data.len() as u64));
+            }
+            Ok(written)
+        })
+        .await?;
+
+        let mut entries = Vec::with_capacity(written.len());
+        for (key, temp_key, data_size) in written {
+            let entry = Fe::create(
+                data_size,
+                self.block_size,
+                RwLock::new(EncodedFilePath {
+                    shared_context: self.shared_context.clone(),
+                    path_type: PathType::Temp,
+                    key: temp_key,
+                }),
+            );
+            entries.push((key, Arc::new(entry)));
+        }
+        self.emplace_files_batch(entries).await
     }
 
     async fn update_with_whole_file(

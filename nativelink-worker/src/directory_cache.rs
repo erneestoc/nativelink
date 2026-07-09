@@ -55,6 +55,15 @@ const CONSTRUCT_DIRECTORY_CONCURRENCY: usize = 64;
 /// and concurrent actions (measured >1800 in-flight fetches for 6
 /// concurrent ~500-file trees without this cap).
 const CONSTRUCT_DIRECTORY_MAX_FETCHES: usize = 64;
+
+/// Files at or below this size take the batched populate+hardlink path in
+/// `construct_directory`; larger files keep the streaming per-file path so
+/// a batch never holds large blobs fully in memory.
+const BATCH_FILE_MAX_SIZE_BYTES: u64 = 128 * 1024;
+
+/// Maximum total bytes of file content per batch. Bounds the memory held by
+/// one `populate_many` call (the fetched contents are in memory all at once).
+const BATCH_MAX_TOTAL_BYTES: u64 = 3 * 1024 * 1024;
 use tokio::sync::{Mutex, RwLock, Semaphore};
 use tracing::{debug, trace, warn};
 
@@ -424,9 +433,54 @@ impl DirectoryCache {
             let mut node_futures: Vec<BoxFuture<'_, Result<u64, Error>>> = Vec::with_capacity(
                 directory.files.len() + directory.directories.len() + directory.symlinks.len(),
             );
+            // Small, non-executable files take the batch path: one batched
+            // fast-store populate plus one batched hardlink pass amortizes
+            // the per-file fixed costs (blocking-pool handoffs, open-file
+            // permits, fsyncs' task spawns) that dominate many-tiny-file
+            // trees. Everything else (executables, zero digests, large
+            // files, no filesystem fast tier) keeps the per-file path.
+            // TODO(prototype-only): benchmark A/B switch, remove before PR.
+            static BATCH_IO_DISABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                std::env::var_os("NL_DISABLE_BATCH_IO").is_some()
+            });
+            let mut batchable: Vec<&FileNode> = Vec::new();
             for file in &directory.files {
+                let batch_eligible = !*BATCH_IO_DISABLED
+                    && self.filesystem_store.is_some()
+                    && !file.is_executable
+                    && file.digest.as_ref().is_some_and(|digest| {
+                        digest.size_bytes > 0
+                            && u64::try_from(digest.size_bytes).unwrap_or(u64::MAX)
+                                <= BATCH_FILE_MAX_SIZE_BYTES
+                    });
+                if batch_eligible {
+                    batchable.push(file);
+                } else {
+                    node_futures.push(Box::pin(async move {
+                        self.create_file(dest_path, file).await.map(|()| 0)
+                    }));
+                }
+            }
+            let mut chunk: Vec<&FileNode> = Vec::new();
+            let mut chunk_bytes = 0u64;
+            for file in batchable {
+                let size = file
+                    .digest
+                    .as_ref()
+                    .map_or(0, |digest| u64::try_from(digest.size_bytes).unwrap_or(0));
+                if !chunk.is_empty() && chunk_bytes + size > BATCH_MAX_TOTAL_BYTES {
+                    let batch = core::mem::take(&mut chunk);
+                    chunk_bytes = 0;
+                    node_futures.push(Box::pin(async move {
+                        self.create_files_batch(dest_path, batch).await.map(|()| 0)
+                    }));
+                }
+                chunk.push(file);
+                chunk_bytes += size;
+            }
+            if !chunk.is_empty() {
                 node_futures.push(Box::pin(async move {
-                    self.create_file(dest_path, file).await.map(|()| 0)
+                    self.create_files_batch(dest_path, chunk).await.map(|()| 0)
                 }));
             }
             for dir_node in &directory.directories {
@@ -461,6 +515,88 @@ impl DirectoryCache {
                 .err_tip(|| format!("Failed to set directory mode: {}", dir.display()))?;
         }
         Ok(())
+    }
+
+    /// Materializes a batch of small, non-executable files: one batched
+    /// populate of the fast store (`populate_many`), then one batched
+    /// hardlink pass (`hardlink_many`). Any file the batch path cannot
+    /// serve (batch populate failure, hardlink `NotFound` after eviction)
+    /// falls back to the per-file `create_file` path, which fetches and
+    /// links under the entry lock.
+    async fn create_files_batch(
+        &self,
+        parent: &Path,
+        files: Vec<&FileNode>,
+    ) -> Result<(), Error> {
+        let Some(filesystem_store) = &self.filesystem_store else {
+            // Batches are only built when a filesystem fast tier exists,
+            // but stay correct if that ever changes.
+            for file in files {
+                self.create_file(parent, file).await?;
+            }
+            return Ok(());
+        };
+
+        let mut digests = Vec::with_capacity(files.len());
+        for file in &files {
+            digests.push(
+                DigestInfo::try_from(file.digest.clone().ok_or_else(|| {
+                    make_err!(Code::InvalidArgument, "File node missing digest")
+                })?)
+                .err_tip(|| "Invalid file digest")?,
+            );
+        }
+
+        let populate_result = {
+            // One fetch permit per batch: the semaphore bounds concurrent
+            // slow-store round trips, and a batch is one round trip.
+            let _permit = self.acquire_fetch_permit().await?;
+            let keys: Vec<StoreKey> = digests.iter().map(|digest| (*digest).into()).collect();
+            self.cas_store.populate_many(&keys).await
+        };
+        if let Err(err) = populate_result {
+            debug!(
+                ?err,
+                num_files = files.len(),
+                "Batch populate failed; falling back to per-file materialization"
+            );
+            for file in files {
+                self.create_file(parent, file).await?;
+            }
+            return Ok(());
+        }
+
+        let links: Vec<(DigestInfo, PathBuf)> = files
+            .iter()
+            .zip(&digests)
+            .map(|(file, digest)| (*digest, parent.join(&file.name)))
+            .collect();
+        match filesystem_store.hardlink_many(links).await {
+            Ok(link_results) => {
+                for (file, link_result) in files.iter().zip(link_results) {
+                    if let Err(err) = link_result {
+                        trace!(
+                            ?err,
+                            file_name = %file.name,
+                            "Batch hardlink miss; falling back to per-file materialization"
+                        );
+                        self.create_file(parent, file).await?;
+                    }
+                }
+                Ok(())
+            }
+            Err(err) => {
+                debug!(
+                    ?err,
+                    num_files = files.len(),
+                    "Batch hardlink failed; falling back to per-file materialization"
+                );
+                for file in files {
+                    self.create_file(parent, file).await?;
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Creates a file from a `FileNode` inside a cache entry.

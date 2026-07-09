@@ -28,7 +28,7 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use futures::{Future, FutureExt, Stream, join, try_join};
+use futures::{Future, FutureExt, Stream, StreamExt, join, try_join};
 use nativelink_error::{Code, Error, ResultExt, error_if, make_err};
 use nativelink_metric::MetricsComponent;
 use rand::rngs::StdRng;
@@ -563,6 +563,31 @@ pub trait StoreLike: Send + Sync + Sized + Unpin + 'static {
             .update_oneshot(digest.into(), data)
     }
 
+    /// Uploads many small, fully-in-memory objects in one batch operation.
+    /// Stores may override the underlying driver method to amortize per-object
+    /// fixed costs (thread handoffs, locks, RPCs); the default behavior is a
+    /// loop of `update_oneshot` calls. Callers should route large blobs
+    /// through the streaming `update` path instead and keep the total bytes
+    /// of a single batch bounded.
+    #[inline]
+    fn update_many<'a>(
+        &'a self,
+        items: Vec<(StoreKey<'static>, Bytes)>,
+    ) -> impl Future<Output = Result<(), Error>> + Send + 'a {
+        self.as_store_driver_pin().update_many(items)
+    }
+
+    /// Reads many small objects in full, returning per-object results so one
+    /// missing object does not fail its peers. The outer `Result` is for
+    /// whole-batch failures (e.g. transport errors).
+    #[inline]
+    fn get_part_many<'a>(
+        &'a self,
+        keys: &'a [StoreKey<'a>],
+    ) -> impl Future<Output = Result<Vec<Result<Bytes, Error>>, Error>> + Send + 'a {
+        self.as_store_driver_pin().get_part_many(keys)
+    }
+
     /// Retrieves part of the data from the store and writes it to the given writer.
     #[inline]
     fn get_part<'a>(
@@ -725,6 +750,37 @@ pub trait StoreDriver:
             self.update(key, rx, UploadSizeInfo::ExactSize(data_len))
         )?;
         Ok(())
+    }
+
+    /// See: [`StoreLike::update_many`] for details.
+    async fn update_many(
+        self: Pin<&Self>,
+        items: Vec<(StoreKey<'static>, Bytes)>,
+    ) -> Result<(), Error> {
+        for (key, data) in items {
+            self.update_oneshot(key, data)
+                .await
+                .err_tip(|| "In default update_many implementation")?;
+        }
+        Ok(())
+    }
+
+    /// See: [`StoreLike::get_part_many`] for details.
+    async fn get_part_many(
+        self: Pin<&Self>,
+        keys: &[StoreKey<'_>],
+    ) -> Result<Vec<Result<Bytes, Error>>, Error> {
+        // Bounded fan-out so the default is not slower than callers that
+        // previously issued their own concurrent per-key reads.
+        const DEFAULT_GET_PART_MANY_CONCURRENCY: usize = 32;
+        let mut read_futures = Vec::with_capacity(keys.len());
+        for key in keys {
+            read_futures.push(self.get_part_unchunked(key.borrow(), 0, None));
+        }
+        Ok(futures::stream::iter(read_futures)
+            .buffered(DEFAULT_GET_PART_MANY_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await)
     }
 
     /// See: [`StoreLike::get_part`] for details.
