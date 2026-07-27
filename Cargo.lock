@@ -3333,6 +3333,7 @@ dependencies = [
  "nativelink-store",
  "nativelink-util",
  "opentelemetry",
+ "opentelemetry_sdk",
  "parking_lot",
  "pathdiff",
  "pretty_assertions",

@@ -39,6 +39,15 @@ use nativelink_util::background_spawn;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc, default_digest_hasher_func};
 use nativelink_util::fs_util::{CloneMethod, hardlink_directory_tree, set_dir_writable_recursive};
+use nativelink_util::metrics::PREPARE_METRICS;
+
+/// Bounded OTEL label for the tree-materialization method.
+const fn clone_method_label(method: CloneMethod) -> &'static str {
+    match method {
+        CloneMethod::Clonefile => "clonefile",
+        CloneMethod::Hardlink => "hardlink_walk",
+    }
+}
 use nativelink_util::store_trait::{StoreKey, StoreLike};
 use prost::Message;
 use tokio::fs;
@@ -387,6 +396,7 @@ impl DirectoryCache {
 
     /// Records which kernel mechanism materialized a tree, for observability.
     fn record_clone_method(&self, method: CloneMethod) {
+        // (see also `clone_method_label` for the OTEL fs-op label)
         let counter = match method {
             CloneMethod::Clonefile => &self.clonefile_hits,
             CloneMethod::Hardlink => &self.hardlink_hits,
@@ -491,10 +501,16 @@ impl DirectoryCache {
     ) -> Option<u64> {
         let (cache_path, size, pin) = self.acquire_entry(digest).await?;
         debug!(?digest, ?cache_path, "Directory cache HIT");
+        let clone_start = std::time::Instant::now();
         match hardlink_directory_tree(&cache_path, dest_path).await {
             Ok(method) => {
                 drop(pin);
                 self.record_clone_method(method);
+                PREPARE_METRICS.record_fs_op(
+                    clone_method_label(method),
+                    "tree",
+                    clone_start.elapsed(),
+                );
                 Some(size)
             }
             Err(e) => {
@@ -632,10 +648,12 @@ impl DirectoryCache {
 
         // Hardlink to destination (unlocked). The entry is pinned so it
         // cannot be evicted from under this hardlink.
+        let clone_start = std::time::Instant::now();
         let result = hardlink_directory_tree(&cache_path, dest_path).await;
         drop(pin);
         let method = result.err_tip(|| "Failed to hardlink newly cached directory")?;
         self.record_clone_method(method);
+        PREPARE_METRICS.record_fs_op(clone_method_label(method), "tree", clone_start.elapsed());
 
         Ok((false, size))
     }
@@ -795,6 +813,7 @@ impl DirectoryCache {
         let digest_hasher = opentelemetry::Context::current()
             .get::<DigestHasherFunc>()
             .map_or_else(default_digest_hasher_func, |v| *v);
+        let prefetch_start = std::time::Instant::now();
         let result: Result<HashMap<DigestInfo, ProtoDirectory>, Error> = async {
             let _permit = self.acquire_fetch_permit().await?;
             let mut protos = HashMap::new();
@@ -839,6 +858,7 @@ impl DirectoryCache {
         .await;
         match result {
             Ok(protos) => {
+                PREPARE_METRICS.record_proto_fetch("get_tree", prefetch_start.elapsed());
                 trace!(?root, protos = protos.len(), "GetTree prefetch complete");
                 Some(protos)
             }
@@ -870,9 +890,12 @@ impl DirectoryCache {
                 directory.clone()
             } else {
                 let _permit = self.acquire_fetch_permit().await?;
-                get_and_decode_digest(self.cas_store.as_ref(), digest.into())
+                let proto_fetch_start = std::time::Instant::now();
+                let directory = get_and_decode_digest(self.cas_store.as_ref(), digest.into())
                     .await
-                    .err_tip(|| format!("Failed to fetch directory digest: {digest:?}"))?
+                    .err_tip(|| format!("Failed to fetch directory digest: {digest:?}"))?;
+                PREPARE_METRICS.record_proto_fetch("directory", proto_fetch_start.elapsed());
+                directory
             };
 
             // Create the destination directory. It must be writable while it

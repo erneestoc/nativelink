@@ -65,6 +65,7 @@ use nativelink_util::action_messages::{
 };
 use nativelink_util::common::{DigestInfo, fs};
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
+use nativelink_util::metrics::PREPARE_METRICS;
 use nativelink_util::metrics_utils::{AsyncCounterWrapper, CounterWithTime};
 use nativelink_util::store_trait::{Store, StoreLike, UploadSizeInfo};
 use nativelink_util::{background_spawn, spawn, spawn_blocking};
@@ -302,9 +303,11 @@ pub fn download_to_directory<'a>(
     current_directory: &'a str,
 ) -> BoxFuture<'a, Result<(), Error>> {
     async move {
+        let proto_fetch_start = Instant::now();
         let directory = get_and_decode_digest::<ProtoDirectory>(cas_store, digest.into())
             .await
             .err_tip(|| "Converting digest to Directory")?;
+        PREPARE_METRICS.record_proto_fetch("directory", proto_fetch_start.elapsed());
         let mut futures = Vec::new();
 
         for file in directory.files {
@@ -327,6 +330,7 @@ pub fn download_to_directory<'a>(
                             // Zero-digest files are never persisted by the
                             // FilesystemStore, so materialise them directly in
                             // the worker exec dir.
+                            let op_start = Instant::now();
                             let mut file_slot = fs::create_file(&dest)
                                 .await
                                 .err_tip(|| format!("Could not create zero-digest file at {dest}"))?;
@@ -334,6 +338,7 @@ pub fn download_to_directory<'a>(
                                 .write_all(&[])
                                 .await
                                 .err_tip(|| format!("Could not write zero-digest file at {dest}"))?;
+                            PREPARE_METRICS.record_fs_op("create", "file", op_start.elapsed());
                         } else if custom_unix_mode.is_some() || mtime.is_some() {
                             // Rare path: per-file metadata (a custom unix_mode or
                             // an mtime) must land on a PRIVATE inode. A
@@ -348,6 +353,7 @@ pub fn download_to_directory<'a>(
                             let src_path = file_entry
                                 .get_file_path_locked(|src| async move { Ok(src) })
                                 .await?;
+                            let op_start = Instant::now();
                             let spawned_dest = dest.clone();
                             spawn_blocking!("download_to_directory_private_copy", move || {
                                 std::fs::copy(&src_path, &spawned_dest).map(|_| ()).map_err(|e| {
@@ -361,6 +367,7 @@ pub fn download_to_directory<'a>(
                             .err_tip(|| {
                                 "Failed to launch spawn_blocking private copy in download_to_directory"
                             })??;
+                            PREPARE_METRICS.record_fs_op("copy", "file", op_start.elapsed());
                         } else {
                             // Hot path: hardlink only — no writable fd is ever
                             // opened for the materialized inode, so a concurrent
@@ -384,6 +391,7 @@ pub fn download_to_directory<'a>(
                                     .get_file_path_locked(|src| async move { Ok(src) })
                                     .await?
                             };
+                            let op_start = Instant::now();
                             fs::hard_link(&src_path, &dest)
                                 .await
                                 .map_err(|e| {
@@ -411,6 +419,7 @@ pub fn download_to_directory<'a>(
                                         e.append(format!("Could not make hardlink from {} to {dest}", src_path.display()))
                                     }
                                 })?;
+                            PREPARE_METRICS.record_fs_op("hardlink", "file", op_start.elapsed());
                             // Hardlinked inodes are already correct (the 0o444
                             // blob or the 0o555 executable variant) and carry no
                             // per-file metadata, so there is nothing to stamp.
@@ -469,9 +478,11 @@ pub fn download_to_directory<'a>(
             let new_directory_path = format!("{}/{}", current_directory, directory.name);
             futures.push(
                 async move {
+                    let op_start = Instant::now();
                     fs::create_dir(&new_directory_path)
                         .await
                         .err_tip(|| format!("Could not create directory {new_directory_path}"))?;
+                    PREPARE_METRICS.record_fs_op("mkdir", "dir", op_start.elapsed());
                     download_to_directory(
                         cas_store,
                         filesystem_store,
@@ -491,12 +502,14 @@ pub fn download_to_directory<'a>(
             let dest = format!("{}/{}", current_directory, symlink_node.name);
             futures.push(
                 async move {
+                    let op_start = Instant::now();
                     fs::symlink(&symlink_node.target, &dest).await.err_tip(|| {
                         format!(
                             "Could not create symlink {} -> {}",
                             symlink_node.target, dest
                         )
                     })?;
+                    PREPARE_METRICS.record_fs_op("symlink", "file", op_start.elapsed());
                     Ok(())
                 }
                 .boxed(),
@@ -1099,16 +1112,28 @@ impl RunningActionImpl {
             let mut state = self.state.lock();
             state.execution_metadata.input_fetch_start_timestamp =
                 (self.running_actions_manager.callbacks.now_fn)();
+            // Worker-side scheduling delay: action arrival on the worker to
+            // the first CAS request of the prepare phase.
+            if let Ok(queue_delay) = state
+                .execution_metadata
+                .input_fetch_start_timestamp
+                .duration_since(state.execution_metadata.worker_start_timestamp)
+            {
+                PREPARE_METRICS.record_stage("queue_delay", queue_delay);
+            }
         }
         let command = {
             // Download and build out our input files/folders. Also fetch and decode our Command.
             let command_fut = self.metrics().get_proto_command_from_store.wrap(async {
-                get_and_decode_digest::<ProtoCommand>(
+                let start = Instant::now();
+                let command = get_and_decode_digest::<ProtoCommand>(
                     self.running_actions_manager.cas_store.as_ref(),
                     self.action_info.command_digest.into(),
                 )
                 .await
-                .err_tip(|| "Converting command_digest to Command")
+                .err_tip(|| "Converting command_digest to Command")?;
+                PREPARE_METRICS.record_stage("command_fetch", start.elapsed());
+                Ok::<_, Error>(command)
             });
             let filesystem_store_pin =
                 Pin::new(self.running_actions_manager.filesystem_store.as_ref());
@@ -1120,6 +1145,8 @@ impl RunningActionImpl {
                 self.did_cleanup.store(false, Ordering::Release);
                 // Download the input files/folder and place them into the temp directory.
                 // Use directory cache if available for better performance.
+                let _materialization_guard = PREPARE_METRICS.materialization_guard();
+                let start = Instant::now();
                 self.metrics()
                     .download_to_directory
                     .wrap(prepare_action_inputs(
@@ -1129,7 +1156,9 @@ impl RunningActionImpl {
                         &self.action_info.input_root_digest,
                         &self.work_directory,
                     ))
-                    .await
+                    .await?;
+                PREPARE_METRICS.record_stage("input_materialize", start.elapsed());
+                Ok(())
             })
             .await?;
             command
@@ -1158,6 +1187,7 @@ impl RunningActionImpl {
                     Result::<(), Error>::Ok(())
                 }
             };
+            let start = Instant::now();
             self.metrics()
                 .prepare_output_files
                 .wrap(try_join_all(
@@ -1170,6 +1200,7 @@ impl RunningActionImpl {
                     command.output_paths.iter().map(prepare_output_directories),
                 ))
                 .await?;
+            PREPARE_METRICS.record_stage("output_paths", start.elapsed());
         }
         debug!(?command, "Worker received command");
         {
@@ -1213,6 +1244,15 @@ impl RunningActionImpl {
             let mut state = self.state.lock();
             state.execution_metadata.execution_start_timestamp =
                 (self.running_actions_manager.callbacks.now_fn)();
+            // Delay between the inputs being ready and the child process
+            // actually being launched (env/sandbox/spawn overhead).
+            if let Ok(pre_spawn_delay) = state
+                .execution_metadata
+                .execution_start_timestamp
+                .duration_since(state.execution_metadata.input_fetch_completed_timestamp)
+            {
+                PREPARE_METRICS.record_stage("pre_spawn_delay", pre_spawn_delay);
+            }
             (
                 state
                     .command_proto
@@ -2199,6 +2239,7 @@ impl RunningAction for RunningActionImpl {
     }
 
     async fn cleanup(self: Arc<Self>) -> Result<Arc<Self>, Error> {
+        let teardown_start = Instant::now();
         let res = self
             .metrics()
             .clone()
@@ -2215,6 +2256,7 @@ impl RunningAction for RunningActionImpl {
                 result.map(move |()| self)
             })
             .await;
+        PREPARE_METRICS.record_stage("teardown", teardown_start.elapsed());
         if let Err(ref e) = res {
             warn!(?e, "Error during cleanup");
         }
