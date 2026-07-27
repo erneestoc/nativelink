@@ -119,6 +119,9 @@ struct ApiWorkerSchedulerImpl {
     allocation_strategy: WorkerAllocationStrategy,
     /// A channel to notify the matching engine that the worker pool has changed.
     worker_change_notify: Arc<Notify>,
+    /// Extra actions a worker may hold while previous results upload
+    /// (see `experimental_max_overlapping_uploads_per_worker`).
+    upload_overlap_allowance: u64,
     /// Worker registry for tracking worker liveness.
     worker_registry: SharedWorkerRegistry,
 
@@ -245,7 +248,11 @@ impl ApiWorkerSchedulerImpl {
         full_worker_logging: bool,
     ) -> Option<WorkerId> {
         // Do a fast check to see if any workers are available at all for work allocation
-        if !self.workers.iter().any(|(_, w)| w.can_accept_work()) {
+        if !self
+            .workers
+            .iter()
+            .any(|(_, w)| w.can_accept_work(self.upload_overlap_allowance))
+        {
             if full_worker_logging {
                 info!("All workers are fully allocated");
             }
@@ -270,7 +277,7 @@ impl ApiWorkerSchedulerImpl {
         // The index only does presence checks for Minimum properties since their
         // values change dynamically as jobs are assigned to workers.
         let worker_matches = |(worker_id, w): &(&WorkerId, &Worker)| -> bool {
-            if !w.can_accept_work() {
+            if !w.can_accept_work(self.upload_overlap_allowance) {
                 if full_worker_logging {
                     info!(
                         "Worker {worker_id} cannot accept work: is_paused={}, is_draining={}, inflight={}/{}",
@@ -347,6 +354,12 @@ impl ApiWorkerSchedulerImpl {
             UpdateOperationType::ExecutionComplete => {
                 // No update here, just restoring platform properties.
                 worker.execution_complete(operation_id);
+                // A backpressure pause may predate this notification; this
+                // action just stopped executing, so clear the pause if the
+                // worker now has capacity (mirrors complete_action).
+                if worker.is_paused && worker.has_capacity(self.upload_overlap_allowance) {
+                    worker.is_paused = false;
+                }
                 self.worker_change_notify.notify_one();
                 return Ok(());
             }
@@ -379,7 +392,9 @@ impl ApiWorkerSchedulerImpl {
             // Note: We need to run this before dealing with backpressure logic.
             let complete_action_res = worker.complete_action(operation_id).await;
 
-            if (due_to_backpressure || !worker.can_accept_work()) && worker.has_actions() {
+            if (due_to_backpressure || !worker.can_accept_work(self.upload_overlap_allowance))
+                && worker.has_actions()
+            {
                 worker.is_paused = true;
             }
             complete_action_res
@@ -504,6 +519,10 @@ pub struct ApiWorkerScheduler {
 }
 
 impl ApiWorkerScheduler {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "constructor mirrors config surface"
+    )]
     pub fn new(
         worker_state_manager: Arc<dyn WorkerStateManager>,
         platform_property_manager: Arc<PlatformPropertyManager>,
@@ -512,10 +531,12 @@ impl ApiWorkerScheduler {
         worker_timeout_s: u64,
         worker_registry: SharedWorkerRegistry,
         maybe_origin_event_tx: Option<mpsc::Sender<OriginEvent>>,
+        upload_overlap_allowance: u64,
     ) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(ApiWorkerSchedulerImpl {
                 workers: Workers(LruCache::unbounded()),
+                upload_overlap_allowance,
                 worker_state_manager,
                 allocation_strategy,
                 worker_change_notify,

@@ -169,6 +169,7 @@ async fn setup_api_server_with_task_limit(
         worker_timeout,
         worker_registry,
         None,
+        0,
     );
 
     let mut schedulers: HashMap<String, Arc<dyn WorkerScheduler>> = HashMap::new();

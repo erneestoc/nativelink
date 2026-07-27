@@ -528,6 +528,7 @@ impl SimpleScheduler {
             worker_timeout_s,
             worker_registry,
             maybe_origin_event_tx.clone(),
+            spec.experimental_max_overlapping_uploads_per_worker,
         );
 
         let worker_scheduler_clone = worker_scheduler.clone();

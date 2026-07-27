@@ -136,6 +136,17 @@ pub struct SimpleSpec {
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
     pub worker_timeout_s: u64,
 
+    /// Number of additional actions the scheduler may assign to a worker
+    /// whose previous actions have finished executing but are still
+    /// uploading their results. Concurrent executions never exceed the
+    /// `max_inflight_tasks` of the worker; this only lets the input fetch
+    /// and execution of the next action overlap the result upload of the
+    /// previous action, bounded by this allowance.
+    ///
+    /// Default: 0 (disabled; identical to previous behavior)
+    #[serde(default)]
+    pub experimental_max_overlapping_uploads_per_worker: u64,
+
     /// Maximum time (seconds) an action can stay in Executing state without
     /// any worker update before being timed out and re-queued.
     /// This applies regardless of worker keepalive status, catching cases

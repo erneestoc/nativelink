@@ -282,12 +282,26 @@ impl Worker {
         }
     }
 
-    pub fn can_accept_work(&self) -> bool {
-        !self.is_paused
-            && !self.is_draining
-            && (self.max_inflight_tasks == 0
-                || u64::try_from(self.running_action_infos.len()).unwrap_or(u64::MAX)
-                    < self.max_inflight_tasks)
+    /// Whether this worker has task capacity, ignoring pause/drain state.
+    pub fn has_capacity(&self, upload_overlap_allowance: u64) -> bool {
+        if self.max_inflight_tasks == 0 {
+            return true;
+        }
+        let total = u64::try_from(self.running_action_infos.len()).unwrap_or(u64::MAX);
+        // Actions whose execution finished but whose results are still
+        // uploading have had their platform properties restored; they no
+        // longer occupy an execution slot, only an upload-overlap slot.
+        let uploading = u64::try_from(self.restored_platform_properties.len()).unwrap_or(u64::MAX);
+        let executing = total.saturating_sub(uploading);
+        executing < self.max_inflight_tasks
+            && total
+                < self
+                    .max_inflight_tasks
+                    .saturating_add(upload_overlap_allowance)
+    }
+
+    pub fn can_accept_work(&self, upload_overlap_allowance: u64) -> bool {
+        !self.is_paused && !self.is_draining && self.has_capacity(upload_overlap_allowance)
     }
 }
 
