@@ -1644,3 +1644,245 @@ async fn get_tree_prefetch_follows_server_pagination() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// Helpers for the input-root stash tests: builds a small Merkle tree in the
+/// slow store and returns the root digest plus the expected file map.
+async fn seed_stash_tree(
+    slow_store: &MemoryStore,
+    shared: &[(&str, &[u8])],
+    unique: &[(&str, &[u8])],
+) -> Result<DigestInfo, Error> {
+    async fn put_files(
+        slow_store: &MemoryStore,
+        files: &[(&str, &[u8])],
+    ) -> Result<Vec<FileNode>, Error> {
+        let mut nodes = Vec::new();
+        for (name, content) in files {
+            let mut hasher = default_digest_hasher_func().hasher();
+            hasher.update(content);
+            let digest = hasher.finalize_digest();
+            slow_store
+                .update_oneshot(digest, Bytes::copy_from_slice(content))
+                .await?;
+            nodes.push(FileNode {
+                name: (*name).to_string(),
+                digest: Some(digest.into()),
+                ..Default::default()
+            });
+        }
+        Ok(nodes)
+    }
+    async fn put_dir(slow_store: &MemoryStore, dir: &ProtoDirectory) -> Result<DigestInfo, Error> {
+        let encoded = dir.encode_to_vec();
+        let mut hasher = default_digest_hasher_func().hasher();
+        hasher.update(&encoded);
+        let digest = hasher.finalize_digest();
+        slow_store
+            .update_oneshot(digest, Bytes::from(encoded))
+            .await?;
+        Ok(digest)
+    }
+    let shared_digest = put_dir(
+        slow_store,
+        &ProtoDirectory {
+            files: put_files(slow_store, shared).await?,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let unique_digest = put_dir(
+        slow_store,
+        &ProtoDirectory {
+            files: put_files(slow_store, unique).await?,
+            ..Default::default()
+        },
+    )
+    .await?;
+    put_dir(
+        slow_store,
+        &ProtoDirectory {
+            directories: vec![
+                DirectoryNode {
+                    name: "shared".to_string(),
+                    digest: Some(shared_digest.into()),
+                },
+                DirectoryNode {
+                    name: "unique".to_string(),
+                    digest: Some(unique_digest.into()),
+                },
+            ],
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+fn stash_cache_config(root: &str, stash_max_entries: usize) -> DirectoryCacheConfig {
+    DirectoryCacheConfig {
+        cache_root: make_temp_path(root).into(),
+        stash_max_entries,
+        ..Default::default()
+    }
+}
+
+#[nativelink_test]
+async fn stash_restore_applies_delta_byte_identical() -> Result<(), Error> {
+    let slow_store = MemoryStore::new(&MemorySpec::default());
+    let root_a = seed_stash_tree(
+        &slow_store,
+        &[("s1", b"shared one"), ("s2", b"shared two")],
+        &[("u1", b"unique a")],
+    )
+    .await?;
+    let root_b = seed_stash_tree(
+        &slow_store,
+        &[("s1", b"shared one"), ("s2", b"shared two")],
+        &[("u2", b"unique b")],
+    )
+    .await?;
+    let cache = DirectoryCache::new(
+        stash_cache_config("stash_hit_cache", 2),
+        make_cas_store(slow_store).await,
+    )
+    .await?;
+
+    let dir_a = std::path::PathBuf::from(make_temp_path("stash_hit_a"));
+    cache.get_or_create(root_a, &dir_a).await?;
+    assert!(cache.stash_input_root(root_a, &dir_a).await?);
+    assert!(!dir_a.exists(), "stash must take the tree");
+
+    let dir_b = std::path::PathBuf::from(make_temp_path("stash_hit_b"));
+    assert!(cache.try_restore_from_stash(root_b, &dir_b).await?);
+    assert_eq!(
+        tokio::fs::read(dir_b.join("shared/s1")).await.unwrap(),
+        b"shared one"
+    );
+    assert_eq!(
+        tokio::fs::read(dir_b.join("shared/s2")).await.unwrap(),
+        b"shared two"
+    );
+    assert_eq!(
+        tokio::fs::read(dir_b.join("unique/u2")).await.unwrap(),
+        b"unique b"
+    );
+    assert!(
+        !dir_b.join("unique/u1").exists(),
+        "stale unique file must be removed by the delta"
+    );
+    let stats = cache.stats().await;
+    assert_eq!(stats.stash_hits, 1);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn stash_zero_overlap_falls_back_and_preserves_stash() -> Result<(), Error> {
+    let slow_store = MemoryStore::new(&MemorySpec::default());
+    let root_a = seed_stash_tree(&slow_store, &[("s1", b"alpha")], &[("u1", b"a")]).await?;
+    // Entirely different tree: no top-level entry matches.
+    let mut hasher = default_digest_hasher_func().hasher();
+    hasher.update(b"lonely");
+    let lonely_digest = hasher.finalize_digest();
+    slow_store
+        .update_oneshot(lonely_digest, Bytes::from_static(b"lonely"))
+        .await?;
+    let other = ProtoDirectory {
+        files: vec![FileNode {
+            name: "other".to_string(),
+            digest: Some(lonely_digest.into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let encoded = other.encode_to_vec();
+    let mut hasher = default_digest_hasher_func().hasher();
+    hasher.update(&encoded);
+    let root_other = hasher.finalize_digest();
+    slow_store
+        .update_oneshot(root_other, Bytes::from(encoded))
+        .await?;
+
+    let cache = DirectoryCache::new(
+        stash_cache_config("stash_miss_cache", 2),
+        make_cas_store(slow_store).await,
+    )
+    .await?;
+    let dir_a = std::path::PathBuf::from(make_temp_path("stash_miss_a"));
+    cache.get_or_create(root_a, &dir_a).await?;
+    assert!(cache.stash_input_root(root_a, &dir_a).await?);
+
+    let dir_o = std::path::PathBuf::from(make_temp_path("stash_miss_o"));
+    assert!(
+        !cache.try_restore_from_stash(root_other, &dir_o).await?,
+        "zero-overlap target must not consume the stash"
+    );
+    cache.get_or_create(root_other, &dir_o).await?;
+    assert_eq!(
+        tokio::fs::read(dir_o.join("other")).await.unwrap(),
+        b"lonely"
+    );
+
+    // The stash must still serve a matching target.
+    let dir_a2 = std::path::PathBuf::from(make_temp_path("stash_miss_a2"));
+    assert!(cache.try_restore_from_stash(root_a, &dir_a2).await?);
+    assert_eq!(
+        tokio::fs::read(dir_a2.join("shared/s1")).await.unwrap(),
+        b"alpha"
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn stash_bounded_eviction_removes_oldest() -> Result<(), Error> {
+    let slow_store = MemoryStore::new(&MemorySpec::default());
+    let root_a = seed_stash_tree(&slow_store, &[("s1", b"one")], &[("u1", b"a")]).await?;
+    let root_b = seed_stash_tree(&slow_store, &[("s1", b"one")], &[("u2", b"b")]).await?;
+    let cache = DirectoryCache::new(
+        stash_cache_config("stash_evict_cache", 1),
+        make_cas_store(slow_store).await,
+    )
+    .await?;
+    let dir_a = std::path::PathBuf::from(make_temp_path("stash_evict_a"));
+    cache.get_or_create(root_a, &dir_a).await?;
+    assert!(cache.stash_input_root(root_a, &dir_a).await?);
+    let dir_b = std::path::PathBuf::from(make_temp_path("stash_evict_b"));
+    cache.get_or_create(root_b, &dir_b).await?;
+    assert!(cache.stash_input_root(root_b, &dir_b).await?);
+
+    // Only one slot: restoring root_a must MISS (it was evicted as oldest),
+    // while root_b restores.
+    let dir_b2 = std::path::PathBuf::from(make_temp_path("stash_evict_b2"));
+    assert!(cache.try_restore_from_stash(root_b, &dir_b2).await?);
+    let dir_a2 = std::path::PathBuf::from(make_temp_path("stash_evict_a2"));
+    assert!(!cache.try_restore_from_stash(root_a, &dir_a2).await?);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn stash_orphans_swept_on_startup() -> Result<(), Error> {
+    let slow_store = MemoryStore::new(&MemorySpec::default());
+    let root_a = seed_stash_tree(&slow_store, &[("s1", b"one")], &[("u1", b"a")]).await?;
+    let cas = make_cas_store(slow_store).await;
+    let config = stash_cache_config("stash_sweep_cache", 2);
+    let cache_root = config.cache_root.clone();
+    {
+        let cache = DirectoryCache::new(config.clone(), cas.clone()).await?;
+        let dir_a = std::path::PathBuf::from(make_temp_path("stash_sweep_a"));
+        cache.get_or_create(root_a, &dir_a).await?;
+        assert!(cache.stash_input_root(root_a, &dir_a).await?);
+        drop(cache);
+    }
+    // New process (new cache on the same root): orphaned stash dirs must be
+    // swept away, not resurrected.
+    let cache2 = DirectoryCache::new(config, cas).await?;
+    let mut rd = tokio::fs::read_dir(&cache_root).await?;
+    while let Some(entry) = rd.next_entry().await? {
+        let name = entry.file_name().to_string_lossy().to_string();
+        assert!(
+            !name.starts_with("stash-"),
+            "orphaned stash dir must be swept at startup: {name}"
+        );
+    }
+    let dir_a2 = std::path::PathBuf::from(make_temp_path("stash_sweep_a2"));
+    assert!(!cache2.try_restore_from_stash(root_a, &dir_a2).await?);
+    Ok(())
+}

@@ -106,6 +106,13 @@ pub struct DirectoryCacheConfig {
     pub max_concurrent_fetches: usize,
     /// See `nativelink-config`'s `DirectoryCacheConfig::experimental_get_tree_prefetch`.
     pub experimental_get_tree_prefetch: bool,
+    /// Experimental: keep up to this many recently torn-down input roots as
+    /// "stashes" and serve new roots by renaming the best-overlapping stash
+    /// back and applying only the Merkle delta (remove extras, link missing)
+    /// instead of constructing the whole tree. 0 disables (default).
+    /// Prototype: worker-local config only; not yet plumbed to the config
+    /// crate.
+    pub stash_max_entries: usize,
 }
 
 impl Default for DirectoryCacheConfig {
@@ -117,6 +124,7 @@ impl Default for DirectoryCacheConfig {
             experimental_subtree_caching: false,
             max_concurrent_fetches: DEFAULT_MAX_CONCURRENT_FETCHES,
             experimental_get_tree_prefetch: false,
+            stash_max_entries: 0,
         }
     }
 }
@@ -198,6 +206,19 @@ impl Drop for ScratchGuard {
 ///
 /// This dramatically reduces I/O and improves action startup time.
 #[derive(Debug)]
+/// A torn-down input root retained for delta reuse. The tree on disk is a
+/// former action input root (read-only hardlinked files, 0o755 directories),
+/// so a later action with an overlapping Merkle tree can rename it back and
+/// patch only the difference.
+struct StashedRoot {
+    /// Root `Directory` digest the stashed tree was materialized from.
+    digest: DigestInfo,
+    /// Current on-disk location, inside `cache_root` so the startup sweep
+    /// reclaims crash orphans.
+    path: PathBuf,
+}
+
+#[derive(Debug)]
 pub struct DirectoryCache {
     /// Configuration
     config: DirectoryCacheConfig,
@@ -218,6 +239,12 @@ pub struct DirectoryCache {
     /// Count of materializations that used APFS `clonefile(2)` (macOS only;
     /// always zero on other platforms).
     clonefile_hits: AtomicU64,
+    /// Stashed input roots available for delta reuse, most recent last.
+    stash: Mutex<Vec<StashedRoot>>,
+    /// Count of input roots served by stash restore + delta apply.
+    stash_hits: AtomicU64,
+    /// Count of restore attempts that found no usable stash.
+    stash_misses: AtomicU64,
     /// Count of materializations that used per-file `fs::hard_link`.
     hardlink_hits: AtomicU64,
     /// Count of subtree materializations served from the cache by the
@@ -296,6 +323,9 @@ impl DirectoryCache {
             filesystem_store,
             fetch_permits: Semaphore::new(max_concurrent_fetches),
             clonefile_hits: AtomicU64::new(0),
+            stash: Mutex::new(Vec::new()),
+            stash_hits: AtomicU64::new(0),
+            stash_misses: AtomicU64::new(0),
             hardlink_hits: AtomicU64::new(0),
             subtree_hits: AtomicU64::new(0),
             subtree_misses: AtomicU64::new(0),
@@ -409,6 +439,281 @@ impl DirectoryCache {
             .get_or_create_entry(digest, dest_path, None, true)
             .await?;
         Ok(hit)
+    }
+
+    /// Retains a finished action's input root for delta reuse instead of
+    /// deleting it. Returns `Ok(true)` when the tree was taken (the caller
+    /// must NOT delete it), `Ok(false)` when stashing is disabled or the
+    /// rename failed (caller cleans up as usual). The oldest stash is
+    /// evicted when the bound is exceeded.
+    pub async fn stash_input_root(&self, digest: DigestInfo, path: &Path) -> Result<bool, Error> {
+        if self.config.stash_max_entries == 0 {
+            return Ok(false);
+        }
+        let seq = self.scratch_seq.fetch_add(1, Ordering::Relaxed);
+        let stash_path = self.config.cache_root.join(format!("stash-{seq}"));
+        if fs::rename(path, &stash_path).await.is_err() {
+            // Cross-volume or already-gone: not stashable.
+            return Ok(false);
+        }
+        let evicted = {
+            let mut stash = self.stash.lock().await;
+            stash.push(StashedRoot {
+                digest,
+                path: stash_path,
+            });
+            if stash.len() > self.config.stash_max_entries {
+                Some(stash.remove(0))
+            } else {
+                None
+            }
+        };
+        if let Some(old) = evicted {
+            Self::remove_tree_best_effort(&old.path).await;
+        }
+        Ok(true)
+    }
+
+    /// Attempts to serve `target` by restoring the best-overlapping stashed
+    /// input root and applying the Merkle delta. Returns `Ok(true)` when
+    /// `dest_path` was fully materialized this way; `Ok(false)` means no
+    /// usable stash (caller constructs normally). The stash is consumed
+    /// either way once selected; on any delta failure the destination is
+    /// cleared so the caller can construct fresh.
+    pub async fn try_restore_from_stash(
+        &self,
+        target: DigestInfo,
+        dest_path: &Path,
+    ) -> Result<bool, Error> {
+        if self.config.stash_max_entries == 0 {
+            return Ok(false);
+        }
+        let candidates: Vec<(DigestInfo, PathBuf)> = {
+            let stash = self.stash.lock().await;
+            stash.iter().map(|s| (s.digest, s.path.clone())).collect()
+        };
+        if candidates.is_empty() {
+            self.stash_misses.fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+        let target_proto = self.fetch_dir_proto(target).await?;
+        // Score by top-level (name, content) overlap; the Merkle property
+        // makes a matching directory entry worth its whole subtree.
+        let mut best: Option<(usize, DigestInfo, PathBuf)> = None;
+        for (digest, path) in candidates {
+            let score = if digest == target {
+                usize::MAX
+            } else {
+                let Ok(proto) = self.fetch_dir_proto(digest).await else {
+                    continue;
+                };
+                Self::score_overlap(&proto, &target_proto)
+            };
+            if score > 0 && best.as_ref().is_none_or(|(b, _, _)| score > *b) {
+                best = Some((score, digest, path));
+            }
+        }
+        let Some((_score, stash_digest, stash_path)) = best else {
+            self.stash_misses.fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        };
+        // Claim the chosen stash; someone may have raced us to it.
+        {
+            let mut stash = self.stash.lock().await;
+            let Some(idx) = stash.iter().position(|s| s.path == stash_path) else {
+                self.stash_misses.fetch_add(1, Ordering::Relaxed);
+                return Ok(false);
+            };
+            stash.remove(idx);
+        }
+        if let Some(parent) = dest_path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .err_tip(|| format!("Creating parent for stash restore: {}", parent.display()))?;
+        }
+        if fs::rename(&stash_path, dest_path).await.is_err() {
+            // Environment problem (e.g. cross-volume destination): return the
+            // stash for a future caller rather than destroying it.
+            self.stash.lock().await.push(StashedRoot {
+                digest: stash_digest,
+                path: stash_path,
+            });
+            self.stash_misses.fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+        let stash_proto = self.fetch_dir_proto(stash_digest).await?;
+        match self
+            .apply_delta_dir(stash_proto, target_proto, dest_path)
+            .await
+        {
+            Ok(()) => {
+                self.stash_hits.fetch_add(1, Ordering::Relaxed);
+                Ok(true)
+            }
+            Err(err) => {
+                // Correctness first: clear the patched tree so the caller
+                // constructs from scratch.
+                warn!(
+                    ?err,
+                    ?target,
+                    "Stash delta apply failed; constructing fresh"
+                );
+                Self::remove_tree_best_effort(dest_path).await;
+                self.stash_misses.fetch_add(1, Ordering::Relaxed);
+                Ok(false)
+            }
+        }
+    }
+
+    /// Counts identical top-level entries (same name and same content
+    /// identity) between two `Directory` protos.
+    fn score_overlap(a: &ProtoDirectory, b: &ProtoDirectory) -> usize {
+        let mut score = 0;
+        for fb in &b.files {
+            if a.files
+                .iter()
+                .any(|fa| fa.name == fb.name && fa.digest == fb.digest)
+            {
+                score += 1;
+            }
+        }
+        for db in &b.directories {
+            if a.directories
+                .iter()
+                .any(|da| da.name == db.name && da.digest == db.digest)
+            {
+                score += 1;
+            }
+        }
+        for sb in &b.symlinks {
+            if a.symlinks
+                .iter()
+                .any(|sa| sa.name == sb.name && sa.target == sb.target)
+            {
+                score += 1;
+            }
+        }
+        score
+    }
+
+    /// Fetches and decodes a `Directory` proto, treating the zero digest as
+    /// the empty directory (many CAS backends do not store zero-byte blobs).
+    async fn fetch_dir_proto(&self, digest: DigestInfo) -> Result<ProtoDirectory, Error> {
+        if is_zero_digest(digest) {
+            return Ok(ProtoDirectory::default());
+        }
+        let _permit = self.acquire_fetch_permit().await?;
+        get_and_decode_digest(self.cas_store.as_ref(), digest.into())
+            .await
+            .err_tip(|| format!("Failed to fetch directory proto for stash delta: {digest:?}"))
+    }
+
+    /// Transforms the on-disk tree at `path` (currently matching `from`) into
+    /// the tree described by `to`: removes entries that are absent or changed,
+    /// then links/creates what is missing. Matching directory digests are
+    /// skipped entirely (Merkle short-circuit), so the walk's cost is
+    /// proportional to the difference, not the tree. When in doubt an entry
+    /// is removed and re-created.
+    fn apply_delta_dir<'a>(
+        &'a self,
+        from: ProtoDirectory,
+        to: ProtoDirectory,
+        path: &'a Path,
+    ) -> BoxFuture<'a, Result<(), Error>> {
+        Box::pin(async move {
+            // Removal pass: anything in `from` that `to` does not carry
+            // forward identically (or whose kind changed) is deleted.
+            for file in &from.files {
+                let keep = to.files.iter().any(|f| {
+                    f.name == file.name
+                        && f.digest == file.digest
+                        && f.is_executable == file.is_executable
+                });
+                if !keep {
+                    let p = path.join(&file.name);
+                    if fs::metadata(&p).await.is_ok() {
+                        fs::remove_file(&p)
+                            .await
+                            .err_tip(|| format!("Removing stale stash file {}", p.display()))?;
+                    }
+                }
+            }
+            for symlink in &from.symlinks {
+                let keep = to
+                    .symlinks
+                    .iter()
+                    .any(|l| l.name == symlink.name && l.target == symlink.target);
+                if !keep {
+                    let p = path.join(&symlink.name);
+                    if fs::symlink_metadata(&p).await.is_ok() {
+                        fs::remove_file(&p)
+                            .await
+                            .err_tip(|| format!("Removing stale stash symlink {}", p.display()))?;
+                    }
+                }
+            }
+            for dir in &from.directories {
+                let keep = to.directories.iter().any(|d| d.name == dir.name);
+                if !keep {
+                    let p = path.join(&dir.name);
+                    fs::remove_dir_all(&p)
+                        .await
+                        .err_tip(|| format!("Removing stale stash dir {}", p.display()))?;
+                }
+            }
+
+            // Addition pass: files and symlinks not carried over.
+            for file in &to.files {
+                let kept = from.files.iter().any(|f| {
+                    f.name == file.name
+                        && f.digest == file.digest
+                        && f.is_executable == file.is_executable
+                });
+                if !kept {
+                    self.create_file(path, file).await?;
+                }
+            }
+            for symlink in &to.symlinks {
+                let kept = from
+                    .symlinks
+                    .iter()
+                    .any(|l| l.name == symlink.name && l.target == symlink.target);
+                if !kept {
+                    self.create_symlink(path, symlink).await?;
+                }
+            }
+
+            // Directory pass: identical digests are kept untouched; existing
+            // directories with a different digest are patched recursively;
+            // new ones are constructed through the normal path (which uses
+            // the subtree cache when enabled).
+            for dir_node in &to.directories {
+                let to_digest = DigestInfo::try_from(dir_node.digest.clone().ok_or_else(|| {
+                    make_err!(Code::InvalidArgument, "Directory node missing digest")
+                })?)
+                .err_tip(|| "Invalid directory digest in stash delta")?;
+                match from.directories.iter().find(|d| d.name == dir_node.name) {
+                    Some(from_node) => {
+                        let from_digest =
+                            DigestInfo::try_from(from_node.digest.clone().ok_or_else(|| {
+                                make_err!(Code::InvalidArgument, "Directory node missing digest")
+                            })?)
+                            .err_tip(|| "Invalid directory digest in stash delta")?;
+                        if from_digest == to_digest {
+                            continue;
+                        }
+                        let from_proto = self.fetch_dir_proto(from_digest).await?;
+                        let to_proto = self.fetch_dir_proto(to_digest).await?;
+                        self.apply_delta_dir(from_proto, to_proto, &path.join(&dir_node.name))
+                            .await?;
+                    }
+                    None => {
+                        self.create_subdirectory(path, dir_node, None).await?;
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Core get-or-create flow shared by root materializations
@@ -1332,6 +1637,8 @@ impl DirectoryCache {
             subtree_hits: self.subtree_hits.load(Ordering::Relaxed),
             subtree_misses: self.subtree_misses.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
+            stash_hits: self.stash_hits.load(Ordering::Relaxed),
+            stash_misses: self.stash_misses.load(Ordering::Relaxed),
         }
     }
 }
@@ -1374,6 +1681,18 @@ impl MetricsComponent for DirectoryCache {
             "Cache entries removed by LRU eviction (high rate = cache thrash)"
         );
         publish!(
+            "stash_hits",
+            &self.stash_hits,
+            MetricKind::Counter,
+            "Input roots served by stash restore plus Merkle delta apply"
+        );
+        publish!(
+            "stash_misses",
+            &self.stash_misses,
+            MetricKind::Counter,
+            "Stash restore attempts with no usable stashed root"
+        );
+        publish!(
             "entries",
             &self.map_entries,
             MetricKind::Default,
@@ -1399,6 +1718,10 @@ pub struct CacheStats {
     pub clonefile_hits: u64,
     /// Materializations that used per-file `fs::hard_link`.
     pub hardlink_hits: u64,
+    /// Input roots served by stash restore plus Merkle delta apply.
+    pub stash_hits: u64,
+    /// Stash restore attempts with no usable stashed root.
+    pub stash_misses: u64,
     /// Subtree materializations served from the cache by digest. Always zero
     /// unless `experimental_subtree_caching` is enabled.
     pub subtree_hits: u64,
