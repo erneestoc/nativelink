@@ -1,12 +1,15 @@
 [Aa]gentic
+[Tt]eardowns?
 Ansys
 Anthropic
 AMI
+APFS
 Astro
 Bazel
 Bazelisk
 [Bb]oolean
 [Kk]eyless
+QoS
 Sigstore
 Cloudflare
 [Cc]oalescers?

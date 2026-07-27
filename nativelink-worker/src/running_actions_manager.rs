@@ -16,7 +16,7 @@ use core::cmp::min;
 use core::convert::Into;
 use core::fmt::Debug;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::time::Duration;
 use std::borrow::Cow;
 use std::collections::vec_deque::VecDeque;
@@ -945,6 +945,221 @@ async fn process_side_channel_file(
     }))
 }
 
+/// Maximum number of action directories staged for deferred deletion before
+/// teardown falls back to today's synchronous delete.
+const MAX_DEFERRED_TEARDOWNS: usize = 4;
+/// Upper bound on how long a staged directory may wait for an idle window
+/// before it is deleted regardless of worker activity.
+const MAX_DEFERRED_TEARDOWN_AGE: Duration = Duration::from_secs(30);
+
+/// Deferred, idle-gated deletion of action directories.
+///
+/// Deleting a large input root concurrently with another action's input
+/// materialization measurably slows the materialization (~1.3x p50 on APFS in
+/// benchmarks) at ANY deleter priority, and a `QOS_CLASS_BACKGROUND` deleter
+/// makes it strictly worse (priority inversion: the throttled thread holds
+/// namespace/journal locks longer). The only winning move is temporal:
+/// teardown renames the directory aside (O(1), frees the action slot and
+/// removes the delete from the action's critical path) and a dedicated
+/// normal-priority thread deletes staged directories when the worker has no
+/// actions in flight — or when the bounded queue/staleness limits force it.
+#[derive(Debug)]
+struct DeferredTeardown {
+    scratch_dir: PathBuf,
+    /// Number of actions currently registered with the manager; the deleter
+    /// only runs opportunistic deletes when this is zero.
+    active_actions: Arc<AtomicUsize>,
+    inner: Arc<DeferredTeardownInner>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+#[derive(Debug)]
+struct DeferredTeardownInner {
+    queue: Mutex<VecDeque<(PathBuf, Instant)>>,
+    cv: parking_lot::Condvar,
+    cv_mutex: parking_lot::Mutex<()>,
+    shutdown: AtomicBool,
+    max_age: Duration,
+    unique_counter: AtomicUsize,
+}
+
+impl DeferredTeardown {
+    fn new(scratch_dir: PathBuf) -> Self {
+        Self::new_with_max_age(scratch_dir, MAX_DEFERRED_TEARDOWN_AGE)
+    }
+
+    fn new_with_max_age(scratch_dir: PathBuf, max_age: Duration) -> Self {
+        let active_actions = Arc::new(AtomicUsize::new(0));
+        let inner = Arc::new(DeferredTeardownInner {
+            queue: Mutex::new(VecDeque::new()),
+            cv: parking_lot::Condvar::new(),
+            cv_mutex: parking_lot::Mutex::new(()),
+            shutdown: AtomicBool::new(false),
+            max_age,
+            unique_counter: AtomicUsize::new(0),
+        });
+        let thread = {
+            let inner = inner.clone();
+            let active = active_actions.clone();
+            let scratch = scratch_dir.clone();
+            // A dedicated OS thread (not the tokio blocking pool) is
+            // deliberate: the deleter outlives any single runtime (tokio
+            // tasks die with their runtime under tests) and must not pin a
+            // blocking-pool thread for the manager's whole lifetime.
+            #[allow(clippy::disallowed_methods)]
+            std::thread::Builder::new()
+                .name("nl_deferred_teardown".to_string())
+                .spawn(move || Self::deleter_loop(&inner, &active, &scratch))
+                .expect("Failed to spawn deferred teardown thread")
+        };
+        Self {
+            scratch_dir,
+            active_actions,
+            inner,
+            thread: Mutex::new(Some(thread)),
+        }
+    }
+
+    const fn active_actions(&self) -> &Arc<AtomicUsize> {
+        &self.active_actions
+    }
+
+    /// Test-only: no deleter thread, so queue state is fully deterministic.
+    #[cfg(test)]
+    fn new_without_thread(scratch_dir: PathBuf) -> Self {
+        Self {
+            scratch_dir,
+            active_actions: Arc::new(AtomicUsize::new(0)),
+            inner: Arc::new(DeferredTeardownInner {
+                queue: Mutex::new(VecDeque::new()),
+                cv: parking_lot::Condvar::new(),
+                cv_mutex: parking_lot::Mutex::new(()),
+                shutdown: AtomicBool::new(false),
+                max_age: MAX_DEFERRED_TEARDOWN_AGE,
+                unique_counter: AtomicUsize::new(0),
+            }),
+            thread: Mutex::new(None),
+        }
+    }
+
+    /// Stages `dir` for deferred deletion. Returns false when the caller must
+    /// delete synchronously instead (queue full or the rename failed).
+    async fn enqueue(&self, dir: &str) -> bool {
+        if self.inner.queue.lock().len() >= MAX_DEFERRED_TEARDOWNS {
+            return false;
+        }
+        if let Err(err) = fs::create_dir_all(&self.scratch_dir).await {
+            debug!(?err, "Could not create teardown scratch dir");
+            return false;
+        }
+        let unique = format!(
+            "{}-{}",
+            Path::new(dir)
+                .file_name()
+                .map_or_else(|| "dir".to_string(), |n| n.to_string_lossy().to_string()),
+            self.inner.unique_counter.fetch_add(1, Ordering::Relaxed),
+        );
+        let staged = self.scratch_dir.join(unique);
+        if let Err(err) = fs::rename(dir, &staged).await {
+            debug!(?err, "Could not stage directory for deferred teardown");
+            return false;
+        }
+        self.inner.queue.lock().push_back((staged, Instant::now()));
+        self.inner.cv.notify_one();
+        true
+    }
+
+    fn make_writable_recursive(path: &Path) {
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return;
+        };
+        if metadata.permissions().readonly() {
+            let mut perms = metadata.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+        if metadata.is_dir()
+            && let Ok(entries) = std::fs::read_dir(path)
+        {
+            for entry in entries.flatten() {
+                Self::make_writable_recursive(&entry.path());
+            }
+        }
+    }
+
+    fn delete_tree_sync(path: &Path) {
+        if let Err(first_err) = std::fs::remove_dir_all(path) {
+            // Action outputs may contain read-only directories; fix
+            // permissions and retry once (mirrors fs::remove_dir_all).
+            Self::make_writable_recursive(path);
+            if let Err(err) = std::fs::remove_dir_all(path) {
+                debug!(
+                    ?first_err,
+                    ?err,
+                    ?path,
+                    "Deferred teardown could not delete tree"
+                );
+            }
+        }
+    }
+
+    fn deleter_loop(inner: &Arc<DeferredTeardownInner>, active: &Arc<AtomicUsize>, scratch: &Path) {
+        // Startup sweep: anything already in the scratch dir is an orphan
+        // from a previous run.
+        if let Ok(entries) = std::fs::read_dir(scratch) {
+            let mut queue = inner.queue.lock();
+            for entry in entries.flatten() {
+                queue.push_back((entry.path(), Instant::now() - inner.max_age));
+            }
+        }
+        loop {
+            let next = {
+                let mut queue = inner.queue.lock();
+                let should_delete = |queue: &VecDeque<(PathBuf, Instant)>| {
+                    queue.front().is_some_and(|(_, staged_at)| {
+                        active.load(Ordering::Relaxed) == 0
+                            || queue.len() >= MAX_DEFERRED_TEARDOWNS
+                            || staged_at.elapsed() >= inner.max_age
+                    })
+                };
+                if should_delete(&queue) {
+                    queue.pop_front()
+                } else {
+                    drop(queue);
+                    if inner.shutdown.load(Ordering::Acquire) {
+                        // Drain whatever remains before exiting.
+                        let mut queue = inner.queue.lock();
+                        while let Some((path, _)) = queue.pop_front() {
+                            drop(queue);
+                            Self::delete_tree_sync(&path);
+                            queue = inner.queue.lock();
+                        }
+                        return;
+                    }
+                    let mut guard = inner.cv_mutex.lock();
+                    inner.cv.wait_for(&mut guard, Duration::from_millis(100));
+                    continue;
+                }
+            };
+            if let Some((path, _)) = next {
+                Self::delete_tree_sync(&path);
+            }
+        }
+    }
+}
+
+impl Drop for DeferredTeardown {
+    fn drop(&mut self) {
+        self.inner.shutdown.store(true, Ordering::Release);
+        self.inner.cv.notify_one();
+        let thread = self.thread.lock().take();
+        if let Some(thread) = thread {
+            let _ = thread.join();
+        }
+    }
+}
+
 async fn do_cleanup(
     running_actions_manager: &Arc<RunningActionsManagerImpl>,
     operation_id: &OperationId,
@@ -959,9 +1174,20 @@ async fn do_cleanup(
 
     debug!("Worker cleaning up");
     // Note: We need to be careful to keep trying to cleanup even if one of the steps fails.
-    let remove_dir_result = fs::remove_dir_all(action_directory)
+    // Prefer staging the directory for deferred, idle-gated deletion: the
+    // rename is O(1), freeing this slot immediately and keeping the deletion
+    // off other actions' materialization window.
+    let remove_dir_result = if running_actions_manager
+        .deferred_teardown
+        .enqueue(action_directory)
         .await
-        .err_tip(|| format!("Could not remove working directory {action_directory}"));
+    {
+        Ok(())
+    } else {
+        fs::remove_dir_all(action_directory)
+            .await
+            .err_tip(|| format!("Could not remove working directory {action_directory}"))
+    };
 
     if let Err(err) = running_actions_manager.cleanup_action(operation_id) {
         error!(%operation_id, ?err, "Error cleaning up action");
@@ -2621,6 +2847,7 @@ pub struct RunningActionsManagerImpl {
     /// input directories and using hardlinks.
     directory_cache: Option<Arc<crate::directory_cache::DirectoryCache>>,
     persistent_worker_pool: PersistentWorkerPool,
+    deferred_teardown: DeferredTeardown,
 }
 
 impl RunningActionsManagerImpl {
@@ -2639,6 +2866,13 @@ impl RunningActionsManagerImpl {
             .get_arc()
             .err_tip(|| "FilesystemStore's internal Arc was lost")?;
         let (action_done_tx, _) = watch::channel(());
+        // Sibling of (not inside) the action root: startup scans, tests, and
+        // retry-collision checks treat the action root's contents as
+        // exclusively per-operation directories.
+        let teardown_scratch_dir = PathBuf::from(format!(
+            "{}.teardown",
+            args.root_action_directory.trim_end_matches('/')
+        ));
         Ok(Self {
             root_action_directory: args.root_action_directory,
             execution_configuration: args.execution_configuration,
@@ -2666,6 +2900,7 @@ impl RunningActionsManagerImpl {
             cleanup_complete_notify: Arc::new(Notify::new()),
             directory_cache: args.directory_cache,
             persistent_worker_pool: PersistentWorkerPool::default(),
+            deferred_teardown: DeferredTeardown::new(teardown_scratch_dir),
             #[cfg(target_os = "linux")]
             use_namespaces: args.use_namespaces,
         })
@@ -2826,6 +3061,11 @@ impl RunningActionsManagerImpl {
 
     fn cleanup_action(&self, operation_id: &OperationId) -> Result<(), Error> {
         let mut running_actions = self.running_actions.lock();
+        if running_actions.contains_key(operation_id) {
+            self.deferred_teardown
+                .active_actions()
+                .fetch_sub(1, Ordering::Relaxed);
+        }
         let result = running_actions.remove(operation_id).err_tip(|| {
             format!("Expected operation id '{operation_id}' to exist in RunningActionsManagerImpl")
         });
@@ -2936,6 +3176,9 @@ impl RunningActionsManager for RunningActionsManagerImpl {
                             ));
                     }
                     running_actions.insert(operation_id, Arc::downgrade(&running_action));
+                    self.deferred_teardown
+                        .active_actions()
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(running_action)
             })
@@ -3055,4 +3298,194 @@ pub struct Metrics {
         help = "Stats about the input-directory cache (hits, misses, subtree reuse, evictions, size)."
     )]
     directory_cache: Option<Weak<crate::directory_cache::DirectoryCache>>,
+}
+
+#[cfg(test)]
+mod deferred_teardown_tests {
+    use core::sync::atomic::Ordering;
+    use core::time::Duration;
+    use std::path::{Path, PathBuf};
+
+    use nativelink_macro::nativelink_test;
+
+    use super::{DeferredTeardown, MAX_DEFERRED_TEARDOWNS};
+
+    fn make_tree(root: &Path, files: usize) {
+        std::fs::create_dir_all(root).unwrap();
+        for i in 0..files {
+            std::fs::File::create(root.join(format!("f{i}"))).unwrap();
+        }
+    }
+
+    fn test_root(name: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("nl_teardown_test_{}_{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(PathBuf::from(format!("{}.scratch", root.display())));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    async fn poll_until(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        cond()
+    }
+
+    #[nativelink_test]
+    async fn enqueue_stages_immediately_and_deletes_when_idle() {
+        let root = test_root("idle");
+        let scratch = PathBuf::from(format!("{}.scratch", root.display()));
+        let teardown = DeferredTeardown::new(scratch.clone());
+        let tree = root.join("action1");
+        make_tree(&tree, 200);
+
+        let start = std::time::Instant::now();
+        let deferred = teardown.enqueue(tree.to_str().unwrap()).await;
+        assert!(deferred, "expected enqueue to defer");
+        assert!(
+            start.elapsed() < Duration::from_millis(250),
+            "enqueue must be O(1) rename, took {:?}",
+            start.elapsed()
+        );
+        assert!(!tree.exists(), "original path must be gone immediately");
+
+        // active_actions == 0, so the staged tree must be deleted shortly.
+        assert!(
+            poll_until(
+                || std::fs::read_dir(&scratch)
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(true),
+                Duration::from_secs(3)
+            )
+            .await,
+            "staged tree must be deleted while idle"
+        );
+        drop(teardown);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[nativelink_test]
+    async fn overflow_falls_back_synchronous() {
+        // Paused (threadless) teardown makes queue state deterministic.
+        let root = test_root("overflow");
+        let scratch = PathBuf::from(format!("{}.scratch", root.display()));
+        let teardown = DeferredTeardown::new_without_thread(scratch.clone());
+
+        for i in 0..MAX_DEFERRED_TEARDOWNS {
+            let tree = root.join(format!("action{i}"));
+            make_tree(&tree, 10);
+            assert!(
+                teardown.enqueue(tree.to_str().unwrap()).await,
+                "enqueue {i} must defer"
+            );
+        }
+        let overflow_tree = root.join("overflow");
+        make_tree(&overflow_tree, 10);
+        assert!(
+            !teardown.enqueue(overflow_tree.to_str().unwrap()).await,
+            "overflow enqueue must fall back to synchronous deletion"
+        );
+        assert!(
+            overflow_tree.exists(),
+            "fallback leaves tree for the caller"
+        );
+        drop(teardown);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[nativelink_test]
+    async fn full_queue_drains_despite_active_gate() {
+        let root = test_root("gate");
+        let scratch = PathBuf::from(format!("{}.scratch", root.display()));
+        let teardown = DeferredTeardown::new(scratch.clone());
+        // Busy worker: the idle gate holds deletions back until the queue
+        // fills, then bounded staleness forces draining.
+        teardown.active_actions().store(1, Ordering::Relaxed);
+        for i in 0..MAX_DEFERRED_TEARDOWNS {
+            let tree = root.join(format!("action{i}"));
+            make_tree(&tree, 10);
+            let _deferred = teardown.enqueue(tree.to_str().unwrap()).await;
+        }
+        // Pressure valve: while busy, the queue sheds only to below the cap
+        // (hovering minimizes deletion concurrent with running actions).
+        assert!(
+            poll_until(
+                || std::fs::read_dir(&scratch)
+                    .map(|d| d.count() < MAX_DEFERRED_TEARDOWNS)
+                    .unwrap_or(true),
+                Duration::from_secs(3)
+            )
+            .await,
+            "full queue must shed below the cap even while active"
+        );
+        // Once idle, everything drains.
+        teardown.active_actions().store(0, Ordering::Relaxed);
+        assert!(
+            poll_until(
+                || std::fs::read_dir(&scratch)
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(true),
+                Duration::from_secs(3)
+            )
+            .await,
+            "queue must fully drain once idle"
+        );
+        drop(teardown);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[nativelink_test]
+    async fn staleness_bound_forces_delete_while_active() {
+        let root = test_root("stale");
+        let scratch = PathBuf::from(format!("{}.scratch", root.display()));
+        let teardown =
+            DeferredTeardown::new_with_max_age(scratch.clone(), Duration::from_millis(200));
+        teardown.active_actions().store(1, Ordering::Relaxed);
+        let tree = root.join("action1");
+        make_tree(&tree, 10);
+        assert!(teardown.enqueue(tree.to_str().unwrap()).await);
+        assert!(
+            poll_until(
+                || std::fs::read_dir(&scratch)
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(true),
+                Duration::from_secs(3)
+            )
+            .await,
+            "stale staged tree must be deleted despite activity"
+        );
+        drop(teardown);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[nativelink_test]
+    async fn startup_sweep_removes_orphans() {
+        let root = test_root("sweep");
+        let scratch = PathBuf::from(format!("{}.scratch", root.display()));
+        make_tree(&scratch.join("orphan-from-last-run"), 20);
+        let teardown = DeferredTeardown::new(scratch.clone());
+        assert!(
+            poll_until(
+                || std::fs::read_dir(&scratch)
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(true),
+                Duration::from_secs(3)
+            )
+            .await,
+            "orphaned scratch trees must be swept at startup"
+        );
+        drop(teardown);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
 }
