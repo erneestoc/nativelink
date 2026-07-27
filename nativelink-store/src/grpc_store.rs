@@ -32,13 +32,10 @@ use nativelink_proto::build::bazel::remote::execution::v2::capabilities_client::
 use nativelink_proto::build::bazel::remote::execution::v2::content_addressable_storage_client::ContentAddressableStorageClient;
 use nativelink_proto::build::bazel::remote::execution::v2::{
     ActionResult, BatchReadBlobsRequest, BatchReadBlobsResponse, BatchUpdateBlobsRequest,
-    BatchUpdateBlobsResponse, FindMissingBlobsRequest, FindMissingBlobsResponse,
-    GetActionResultRequest, GetTreeRequest, GetTreeResponse, SpliceBlobRequest, SpliceBlobResponse,
-    SplitBlobRequest, SplitBlobResponse, UpdateActionResultRequest, compressor,
     BatchUpdateBlobsResponse, Digest, FindMissingBlobsRequest, FindMissingBlobsResponse,
     GetActionResultRequest, GetCapabilitiesRequest, GetTreeRequest, GetTreeResponse,
     SpliceBlobRequest, SpliceBlobResponse, SplitBlobRequest, SplitBlobResponse,
-    UpdateActionResultRequest, batch_update_blobs_request, chunking_function,
+    UpdateActionResultRequest, batch_update_blobs_request, chunking_function, compressor,
 };
 use nativelink_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use nativelink_proto::google::bytestream::{
@@ -62,7 +59,6 @@ use nativelink_util::telemetry::ClientHeaders;
 use nativelink_util::wire_compression::{
     stream_decode_compressed_upload, stream_encode_compressed_download_from_reader,
 };
-use nativelink_util::{background_spawn, default_health_status_indicator, tls_utils};
 use nativelink_util::{
     background_spawn, default_health_status_indicator, spawn_blocking, tls_utils,
 };
@@ -76,8 +72,7 @@ use tokio::time::sleep;
 use tokio_util::io::StreamReader;
 use tonic::metadata::{Ascii, MetadataKey, MetadataValue};
 use tonic::{Code, IntoRequest, Request, Response, Status, Streaming};
-use tracing::{debug, error, trace, warn};
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 struct TonicMetadataInjector<'a>(&'a mut tonic::metadata::MetadataMap);
@@ -1672,6 +1667,8 @@ impl GrpcStore {
                 Ok(Some(forwarded.load(Ordering::Relaxed)))
             }
         }
+    }
+
     /// Validates that a `BatchUpdateBlobs` response covers exactly the request
     /// entries and returns the entries whose per-entry status failed. REAPI
     /// permits response entries to be returned in a different order, so
@@ -2192,10 +2189,6 @@ impl StoreDriver for GrpcStore {
             return self.update_action_result_from_bytes(digest, reader).await;
         }
 
-        if self.remote_cache_compression_enabled
-            && digest.size_bytes() >= WIRE_COMPRESSION_MIN_SIZE_BYTES
-        {
-            return self.update_compressed(digest, reader).await;
         // Resolved once and shared by the chunked and plain paths so their
         // digest-function handling can never diverge.
         let hasher_func = Context::current()
@@ -2215,6 +2208,12 @@ impl StoreDriver for GrpcStore {
             return self
                 .chunked_update(digest, reader, expected_size, hasher_func)
                 .await;
+        }
+
+        if self.remote_cache_compression_enabled
+            && digest.size_bytes() >= WIRE_COMPRESSION_MIN_SIZE_BYTES
+        {
+            return self.update_compressed(digest, reader).await;
         }
 
         let mut buf = Uuid::encode_buffer();
