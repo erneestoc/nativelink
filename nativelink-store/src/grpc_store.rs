@@ -22,7 +22,7 @@ use std::sync::{Arc, Weak};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use fastcdc::v2020::{AsyncStreamCDC, Normalization};
-use futures::stream::{FuturesUnordered, unfold};
+use futures::stream::{FuturesOrdered, FuturesUnordered, unfold};
 use futures::{Future, Stream, StreamExt, TryFutureExt, TryStreamExt, future};
 use nativelink_config::stores::{GrpcChunkedUploadsConfig, GrpcReadBatchingConfig, GrpcSpec};
 use nativelink_error::{Error, ResultExt, error_if, make_err};
@@ -145,6 +145,14 @@ const CHUNKED_UPLOAD_WINDOW_CHUNKS: usize = 128;
 /// narrows the burst rather than growing it — and runs in the post-action
 /// upload phase alongside the already-concurrent output upload fan-out.
 const CHUNKED_UPLOAD_HASH_PARALLELISM_CEILING: usize = 8;
+
+/// Maximum chunk windows allowed in flight concurrently during a chunked
+/// upload. Pipelining lets window N+1's chunking and hashing (CPU) and
+/// `FindMissingBlobs` overlap window N's `BatchUpdateBlobs` transfers, so a
+/// high-RTT link is not paid serially per window. Memory bound: in-flight
+/// windows plus the window being accumulated, each holding at most
+/// `CHUNKED_UPLOAD_WINDOW_BYTES` of chunk data (4 x 8MiB = 32MiB worst case).
+const CHUNKED_UPLOAD_PIPELINE_WINDOWS: usize = 3;
 
 /// Effective chunk-hash fan-out for this host.
 fn chunk_hash_parallelism() -> usize {
@@ -1591,6 +1599,26 @@ impl GrpcStore {
         Ok(hashed)
     }
 
+    /// Hashes and flushes one chunk window, returning the window's chunk
+    /// digests in their original order. Used by `chunked_update` to keep a
+    /// bounded number of windows in flight; the returned digests are
+    /// collected in submission order via `FuturesOrdered`, so the final
+    /// `SpliceBlob` chunk list stays ordered even though windows complete
+    /// their network work out of order.
+    async fn process_chunk_window(
+        &self,
+        uploader: &ChunkedUploader,
+        hasher_func: DigestHasherFunc,
+        digest_function: i32,
+        window: Vec<Bytes>,
+    ) -> Result<Vec<Digest>, Error> {
+        let hashed = Self::hash_chunks_parallel(hasher_func, window).await?;
+        let digests: Vec<Digest> = hashed.iter().map(|(d, _)| Digest::from(*d)).collect();
+        self.flush_chunk_window(uploader, hashed, digest_function)
+            .await?;
+        Ok(digests)
+    }
+
     /// Uploads a large blob as content-defined chunks: `FastCDC`-splits the
     /// stream, transfers only the chunks the backend is missing, and
     /// assembles the blob remotely with `SpliceBlob`.
@@ -1631,7 +1659,27 @@ impl GrpcStore {
         let mut window_bytes = 0usize;
         let mut total_bytes = 0u64;
         let mut chunk_count = 0u64;
-        while let Some(chunk_result) = cdc_stream.next().await {
+        // Windows in flight, bounded by CHUNKED_UPLOAD_PIPELINE_WINDOWS.
+        // FuturesOrdered yields results in submission order, which keeps
+        // all_chunk_digests in blob order for the final SpliceBlob while the
+        // windows' network work overlaps. Dropping this future mid-upload
+        // drops the in-flight windows with it (plain awaits, no detached
+        // work), preserving today's cancellation semantics.
+        let mut inflight = FuturesOrdered::new();
+        loop {
+            let chunk_result = tokio::select! {
+                done = inflight.next(), if !inflight.is_empty() => {
+                    let done: Result<Vec<Digest>, Error> =
+                        done.expect("inflight checked non-empty");
+                    all_chunk_digests
+                        .extend(done.err_tip(|| "In GrpcStore::chunked_update")?);
+                    continue;
+                }
+                chunk_result = cdc_stream.next() => chunk_result,
+            };
+            let Some(chunk_result) = chunk_result else {
+                break;
+            };
             let chunk = chunk_result
                 .map_err(|e| make_err!(Code::Internal, "Failed to chunk blob: {e:?}"))
                 .err_tip(|| "In GrpcStore::chunked_update")?;
@@ -1647,19 +1695,29 @@ impl GrpcStore {
             if window.len() >= CHUNKED_UPLOAD_WINDOW_CHUNKS
                 || window_bytes >= CHUNKED_UPLOAD_WINDOW_BYTES
             {
-                let hashed =
-                    Self::hash_chunks_parallel(hasher_func, core::mem::take(&mut window)).await?;
-                all_chunk_digests.extend(hashed.iter().map(|(d, _)| Digest::from(*d)));
-                self.flush_chunk_window(uploader, hashed, digest_function)
-                    .await?;
+                while inflight.len() >= CHUNKED_UPLOAD_PIPELINE_WINDOWS {
+                    let done = inflight.next().await.expect("inflight checked non-empty");
+                    all_chunk_digests.extend(done.err_tip(|| "In GrpcStore::chunked_update")?);
+                }
+                inflight.push_back(self.process_chunk_window(
+                    uploader,
+                    hasher_func,
+                    digest_function,
+                    core::mem::take(&mut window),
+                ));
                 window_bytes = 0;
             }
         }
         if !window.is_empty() {
-            let hashed = Self::hash_chunks_parallel(hasher_func, window).await?;
-            all_chunk_digests.extend(hashed.iter().map(|(d, _)| Digest::from(*d)));
-            self.flush_chunk_window(uploader, hashed, digest_function)
-                .await?;
+            inflight.push_back(self.process_chunk_window(
+                uploader,
+                hasher_func,
+                digest_function,
+                window,
+            ));
+        }
+        while let Some(done) = inflight.next().await {
+            all_chunk_digests.extend(done.err_tip(|| "In GrpcStore::chunked_update")?);
         }
         error_if!(
             total_bytes != expected_size,
