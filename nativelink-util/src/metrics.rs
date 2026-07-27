@@ -14,6 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use core::time::Duration;
 use std::sync::LazyLock;
 use std::time::SystemTime;
 
@@ -28,6 +29,12 @@ pub const CACHE_RESULT: &str = "cache.operation.result";
 
 // Metric attribute keys for remote execution operations.
 pub const EXECUTION_STAGE: &str = "execution.stage";
+
+// Metric attribute keys for worker action-preparation metrics.
+pub const WORKER_PREPARE_STAGE: &str = "worker.prepare.stage";
+pub const WORKER_FS_OP: &str = "worker.fs.op";
+pub const WORKER_FS_TARGET: &str = "worker.fs.target";
+pub const WORKER_PROTO_KIND: &str = "worker.proto.kind";
 pub const EXECUTION_RESULT: &str = "execution.result";
 pub const EXECUTION_INSTANCE: &str = "execution.instance";
 pub const EXECUTION_PRIORITY: &str = "execution.priority";
@@ -594,6 +601,137 @@ pub struct ExecutionMetrics {
     pub execution_output_size: metrics::Histogram<u64>,
     /// Counter for execution retries
     pub execution_retry_count: metrics::Counter<u64>,
+}
+
+/// Global worker action-preparation metrics instruments.
+///
+/// These attribute prepare-phase wall time to its components so operators can
+/// distinguish CAS/Merkle RPC latency from local filesystem work and worker
+/// scheduling delay. All attributes are drawn from small fixed sets (stage,
+/// filesystem op kind, proto kind); there are no per-action or per-path
+/// labels, so cardinality is bounded by construction.
+pub static PREPARE_METRICS: LazyLock<PrepareMetrics> = LazyLock::new(|| {
+    let meter = global::meter_with_scope(InstrumentationScope::builder("nativelink").build());
+
+    PrepareMetrics {
+        prepare_stage_duration: meter
+            .f64_histogram("worker.prepare.stage.duration")
+            .with_description(
+                "Duration of each worker action-preparation stage in milliseconds",
+            )
+            .with_unit("ms")
+            .with_boundaries(vec![
+                0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0,
+                5000.0, 10000.0, 30000.0,
+            ])
+            .build(),
+
+        proto_fetch_duration: meter
+            .f64_histogram("worker.prepare.proto_fetch.duration")
+            .with_description(
+                "Duration of individual proto fetch+decode calls during input preparation in milliseconds",
+            )
+            .with_unit("ms")
+            .with_boundaries(vec![
+                0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0,
+                1000.0, 5000.0,
+            ])
+            .build(),
+
+        fs_op_duration: meter
+            .f64_histogram("worker.prepare.fs_op.duration")
+            .with_description(
+                "Duration of individual local filesystem operations during materialization in milliseconds",
+            )
+            .with_unit("ms")
+            .with_boundaries(vec![
+                0.001, 0.005, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0,
+                500.0, 1000.0,
+            ])
+            .build(),
+
+        fs_ops: meter
+            .u64_counter("worker.prepare.fs.ops")
+            .with_description("Local filesystem operations performed during materialization")
+            .with_unit("{operation}")
+            .build(),
+
+        materializations_active: meter
+            .i64_up_down_counter("worker.prepare.materializations.active")
+            .with_description("Input materializations currently in flight on this worker")
+            .with_unit("{materialization}")
+            .build(),
+    }
+});
+
+/// OpenTelemetry metrics instruments for worker action preparation.
+#[derive(Debug)]
+pub struct PrepareMetrics {
+    /// Histogram of per-action preparation stage durations in milliseconds
+    pub prepare_stage_duration: metrics::Histogram<f64>,
+    /// Histogram of per-call proto fetch+decode durations in milliseconds
+    pub proto_fetch_duration: metrics::Histogram<f64>,
+    /// Histogram of per-call local filesystem op durations in milliseconds
+    pub fs_op_duration: metrics::Histogram<f64>,
+    /// Counter of local filesystem ops by kind and target
+    pub fs_ops: metrics::Counter<u64>,
+    /// Input materializations currently in flight
+    pub materializations_active: metrics::UpDownCounter<i64>,
+}
+
+impl PrepareMetrics {
+    fn duration_ms(duration: Duration) -> f64 {
+        duration.as_secs_f64() * 1000.0
+    }
+
+    /// Records one per-action preparation stage duration. `stage` must come
+    /// from a small fixed set (e.g. `queue_delay`, `command_fetch`,
+    /// `input_materialize`, `output_paths`, `pre_spawn_delay`, `teardown`).
+    pub fn record_stage(&self, stage: &'static str, duration: Duration) {
+        self.prepare_stage_duration.record(
+            Self::duration_ms(duration),
+            &[KeyValue::new(WORKER_PREPARE_STAGE, stage)],
+        );
+    }
+
+    /// Records one proto fetch+decode call. `kind` is `directory` or
+    /// `get_tree`.
+    pub fn record_proto_fetch(&self, kind: &'static str, elapsed: Duration) {
+        self.proto_fetch_duration.record(
+            Self::duration_ms(elapsed),
+            &[KeyValue::new(WORKER_PROTO_KIND, kind)],
+        );
+    }
+
+    /// Records one local filesystem operation. `op` is one of `mkdir`,
+    /// `hardlink`, `hardlink_walk`, `clonefile`, `copy`, `create`, `symlink`;
+    /// `target` is `file`, `dir`, or `tree`.
+    pub fn record_fs_op(&self, op: &'static str, target: &'static str, elapsed: Duration) {
+        let attrs = [
+            KeyValue::new(WORKER_FS_OP, op),
+            KeyValue::new(WORKER_FS_TARGET, target),
+        ];
+        self.fs_op_duration
+            .record(Self::duration_ms(elapsed), &attrs);
+        self.fs_ops.add(1, &attrs);
+    }
+
+    /// Tracks an in-flight input materialization for the guard's lifetime.
+    /// Drop-based so cancellation at any await point still decrements.
+    pub fn materialization_guard(&self) -> MaterializationGuard {
+        self.materializations_active.add(1, &[]);
+        MaterializationGuard {}
+    }
+}
+
+/// RAII guard for the in-flight materialization gauge.
+#[derive(Debug)]
+pub struct MaterializationGuard {}
+
+impl Drop for MaterializationGuard {
+    fn drop(&mut self) {
+        PREPARE_METRICS.materializations_active.add(-1, &[]);
+    }
 }
 
 /// Helper function to create attributes for execution metrics
