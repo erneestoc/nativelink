@@ -709,6 +709,7 @@ pub async fn new_local_worker(
             max_cleanup_backoff,
             timeout_handled_externally: config.timeout_handled_externally,
             directory_cache,
+            batched_existence_check: config.experimental_batched_output_existence_check.clone(),
             #[cfg(target_os = "linux")]
             use_namespaces,
         })?);

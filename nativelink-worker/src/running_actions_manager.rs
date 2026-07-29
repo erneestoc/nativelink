@@ -40,7 +40,8 @@ use futures::future::{
 };
 use futures::stream::{FuturesUnordered, StreamExt, TryStreamExt};
 use nativelink_config::cas_server::{
-    EnvironmentSource, UploadActionResultConfig, UploadCacheResultsStrategy,
+    BatchedExistenceCheckConfig, EnvironmentSource, UploadActionResultConfig,
+    UploadCacheResultsStrategy,
 };
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
 use nativelink_metric::MetricsComponent;
@@ -65,6 +66,7 @@ use nativelink_util::action_messages::{
 };
 use nativelink_util::common::{DigestInfo, fs};
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
+use nativelink_util::metrics::OUTPUT_UPLOAD_METRICS;
 use nativelink_util::metrics_utils::{AsyncCounterWrapper, CounterWithTime};
 use nativelink_util::store_trait::{Store, StoreLike, UploadSizeInfo};
 use nativelink_util::{background_spawn, spawn, spawn_blocking};
@@ -604,12 +606,108 @@ fn is_executable(metadata: &std::fs::Metadata, _full_path: &impl AsRef<Path>) ->
 
 type DigestUploader = Arc<tokio::sync::OnceCell<()>>;
 
+/// Shared state threaded through an action's output upload: the per-digest
+/// upload deduplicator and the optional batched existence checker.
+#[derive(Clone)]
+struct OutputUploadContext {
+    digest_uploaders: Arc<Mutex<HashMap<DigestInfo, DigestUploader>>>,
+    existence_checker: Option<Arc<BatchedExistenceChecker>>,
+}
+
+/// Coalesces concurrent output-blob existence checks into bounded
+/// `has_with_results` calls (one `FindMissingBlobs` request per batch on
+/// gRPC-backed stores) using group commit: the first arrival dispatches
+/// immediately, and checks that arrive while a batch is in flight form the
+/// next batch — a lone check pays no added latency, and bursts batch
+/// automatically.
+struct BatchedExistenceChecker {
+    store: Store,
+    max_digests_per_batch: usize,
+    state: Mutex<BatcherState>,
+}
+
+#[derive(Default)]
+struct BatcherState {
+    queue: Vec<(DigestInfo, oneshot::Sender<Result<bool, Error>>)>,
+    dispatcher_running: bool,
+}
+
+impl BatchedExistenceChecker {
+    fn new(store: Store, max_digests_per_batch: usize) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            max_digests_per_batch: max_digests_per_batch.max(1),
+            state: Mutex::new(BatcherState::default()),
+        })
+    }
+
+    /// Returns whether `digest` already exists in the store. Errors from the
+    /// underlying existence request are returned so the caller can decide
+    /// (the upload path treats an error as "missing" and uploads).
+    async fn exists(self: &Arc<Self>, digest: DigestInfo) -> Result<bool, Error> {
+        let (tx, rx) = oneshot::channel();
+        let start_dispatcher = {
+            let mut state = self.state.lock();
+            state.queue.push((digest, tx));
+            !core::mem::replace(&mut state.dispatcher_running, true)
+        };
+        if start_dispatcher {
+            let this = self.clone();
+            // The dispatcher is detached so that cancelling one waiter can
+            // never strand the others; it exits when the queue drains.
+            background_spawn!("output_upload_existence_batcher", async move {
+                this.run_dispatcher().await;
+            });
+        }
+        rx.await
+            .map_err(|_| make_err!(Code::Internal, "Existence batch dispatcher went away"))?
+    }
+
+    async fn run_dispatcher(self: Arc<Self>) {
+        loop {
+            let batch = {
+                let mut state = self.state.lock();
+                if state.queue.is_empty() {
+                    state.dispatcher_running = false;
+                    return;
+                }
+                let take = state.queue.len().min(self.max_digests_per_batch);
+                state.queue.drain(..take).collect::<Vec<_>>()
+            };
+            let keys: Vec<nativelink_util::store_trait::StoreKey> =
+                batch.iter().map(|(digest, _)| (*digest).into()).collect();
+            let mut results = vec![None; keys.len()];
+            let check_start = std::time::Instant::now();
+            let check_result = self.store.has_with_results(&keys, &mut results).await;
+            OUTPUT_UPLOAD_METRICS
+                .find_missing_duration
+                .record(check_start.elapsed().as_secs_f64(), &[]);
+            OUTPUT_UPLOAD_METRICS
+                .digests_checked
+                .add(batch.len() as u64, &[]);
+            match check_result {
+                Ok(()) => {
+                    for ((_, tx), result) in batch.into_iter().zip(results) {
+                        // Ignore send errors: the waiter may have been cancelled.
+                        drop(tx.send(Ok(result.is_some())));
+                    }
+                }
+                Err(err) => {
+                    for (_, tx) in batch {
+                        drop(tx.send(Err(err.clone())));
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn upload_file(
     cas_store: Pin<&impl StoreLike>,
     full_path: impl AsRef<Path> + Debug + Send + Sync,
     hasher: DigestHasherFunc,
     metadata: std::fs::Metadata,
-    digest_uploaders: Arc<Mutex<HashMap<DigestInfo, DigestUploader>>>,
+    upload_ctx: OutputUploadContext,
 ) -> Result<FileInfo, Error> {
     let is_executable = is_executable(&metadata, &full_path);
     let file_size = metadata.len();
@@ -623,7 +721,7 @@ async fn upload_file(
         .await
         .err_tip(|| format!("Failed to hash file in digest_for_file failed for {full_path:?}"))?;
 
-    let digest_uploader = match digest_uploaders.lock().entry(digest) {
+    let digest_uploader = match upload_ctx.digest_uploaders.lock().entry(digest) {
         std::collections::hash_map::Entry::Occupied(occupied_entry) => occupied_entry.get().clone(),
         std::collections::hash_map::Entry::Vacant(vacant_entry) => vacant_entry
             .insert(Arc::new(tokio::sync::OnceCell::new()))
@@ -639,11 +737,24 @@ async fn upload_file(
             let cas_store = cas_store.as_store_driver_pin();
             let store_key: nativelink_util::store_trait::StoreKey<'_> = digest.into();
             let has_start = std::time::Instant::now();
-            if cas_store
-                .has(store_key.borrow())
-                .await
-                .is_ok_and(|result| result.is_some())
-            {
+            let already_exists = if let Some(checker) = &upload_ctx.existence_checker {
+                // An existence-check failure falls through to uploading,
+                // matching the unbatched path's semantics below.
+                checker.exists(digest).await.unwrap_or(false)
+            } else {
+                cas_store
+                    .has(store_key.borrow())
+                    .await
+                    .is_ok_and(|result| result.is_some())
+            };
+            OUTPUT_UPLOAD_METRICS
+                .bytes_total
+                .add(digest.size_bytes(), &[]);
+            if already_exists {
+                OUTPUT_UPLOAD_METRICS.blobs_skipped_existing.add(1, &[]);
+                OUTPUT_UPLOAD_METRICS
+                    .bytes_skipped_existing
+                    .add(digest.size_bytes(), &[]);
                 trace!(
                     ?digest,
                     has_elapsed_ms = has_start.elapsed().as_millis(),
@@ -683,7 +794,12 @@ async fn upload_file(
             );
 
             match upload_result {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    OUTPUT_UPLOAD_METRICS
+                        .bytes_sent
+                        .add(digest.size_bytes(), &[]);
+                    Ok(())
+                }
                 Err(err) => {
                     // Output uploads run concurrently and may overlap (e.g. a file is listed
                     // both as an output file and inside an output directory). When another
@@ -783,7 +899,7 @@ fn upload_directory<'a, P: AsRef<Path> + Debug + Send + Sync + Clone + 'a>(
     full_dir_path: P,
     full_work_directory: &'a str,
     hasher: DigestHasherFunc,
-    digest_uploaders: Arc<Mutex<HashMap<DigestInfo, DigestUploader>>>,
+    upload_ctx: OutputUploadContext,
 ) -> BoxFuture<'a, Result<(Directory, VecDeque<ProtoDirectory>), Error>> {
     Box::pin(async move {
         let file_futures = FuturesUnordered::new();
@@ -814,7 +930,7 @@ fn upload_directory<'a, P: AsRef<Path> + Debug + Send + Sync + Clone + 'a>(
                             full_path.clone(),
                             full_work_directory,
                             hasher,
-                            digest_uploaders.clone(),
+                            upload_ctx.clone(),
                         )
                         .and_then(|(dir, all_dirs)| async move {
                             let directory_name = full_path
@@ -848,12 +964,12 @@ fn upload_directory<'a, P: AsRef<Path> + Debug + Send + Sync + Clone + 'a>(
                         .boxed(),
                     );
                 } else if file_type.is_file() {
-                    let digest_uploaders = digest_uploaders.clone();
+                    let upload_ctx = upload_ctx.clone();
                     file_futures.push(async move {
                         let metadata = fs::metadata(&full_path)
                             .await
                             .err_tip(|| format!("Could not open file {}", full_path.display()))?;
-                        upload_file(cas_store, &full_path, hasher, metadata, digest_uploaders)
+                        upload_file(cas_store, &full_path, hasher, metadata, upload_ctx)
                             .map_ok(TryInto::try_into)
                             .await?
                     });
@@ -1745,7 +1861,20 @@ impl RunningActionImpl {
             output_paths.append(&mut command_proto.output_files);
             output_paths.append(&mut command_proto.output_directories);
         }
-        let digest_uploaders = Arc::new(Mutex::new(HashMap::new()));
+        let existence_checker = self
+            .running_actions_manager
+            .batched_existence_check
+            .as_ref()
+            .map(|config| {
+                BatchedExistenceChecker::new(
+                    Store::new(self.running_actions_manager.cas_store.clone()),
+                    config.max_digests_per_batch,
+                )
+            });
+        let upload_ctx = OutputUploadContext {
+            digest_uploaders: Arc::new(Mutex::new(HashMap::new())),
+            existence_checker,
+        };
         for entry in output_paths {
             let full_path = OsString::from(if command_proto.working_directory.is_empty() {
                 format!("{}/{}", self.work_directory, entry)
@@ -1756,7 +1885,7 @@ impl RunningActionImpl {
                 )
             });
             let work_directory = &self.work_directory;
-            let digest_uploaders = digest_uploaders.clone();
+            let upload_ctx = upload_ctx.clone();
             output_path_futures.push(async move {
                 let metadata = {
                     let metadata = match fs::symlink_metadata(&full_path).await {
@@ -1780,7 +1909,7 @@ impl RunningActionImpl {
                                 &full_path,
                                 hasher,
                                 metadata,
-                                digest_uploaders,
+                                upload_ctx,
                             )
                             .await
                             .map(|mut file_info| {
@@ -1799,7 +1928,7 @@ impl RunningActionImpl {
                             &full_path,
                             work_directory,
                             hasher,
-                            digest_uploaders,
+                            upload_ctx,
                         )
                         .and_then(|(root_dir, children)| async move {
                             let tree = ProtoTree {
@@ -1845,7 +1974,7 @@ impl RunningActionImpl {
                                             &full_path,
                                             work_directory,
                                             hasher,
-                                            digest_uploaders,
+                                            upload_ctx,
                                         )
                                         .and_then(|(root_dir, children)| async move {
                                             let tree = ProtoTree {
@@ -1880,7 +2009,7 @@ impl RunningActionImpl {
                                             &full_path,
                                             hasher,
                                             resolved_meta,
-                                            digest_uploaders,
+                                            upload_ctx,
                                         )
                                         .await
                                         .map(|mut file_info| {
@@ -2567,6 +2696,7 @@ pub struct RunningActionsManagerArgs<'a> {
     pub max_cleanup_backoff: Duration,
     pub timeout_handled_externally: bool,
     pub directory_cache: Option<Arc<crate::directory_cache::DirectoryCache>>,
+    pub batched_existence_check: Option<BatchedExistenceCheckConfig>,
     #[cfg(target_os = "linux")]
     pub use_namespaces: UseNamespaces,
 }
@@ -2599,6 +2729,7 @@ pub struct RunningActionsManagerImpl {
     max_action_timeout: Duration,
     max_upload_timeout: Duration,
     timeout_handled_externally: bool,
+    batched_existence_check: Option<BatchedExistenceCheckConfig>,
     #[cfg(target_os = "linux")]
     use_namespaces: UseNamespaces,
     running_actions: Mutex<HashMap<OperationId, Weak<RunningActionImpl>>>,
@@ -2653,6 +2784,7 @@ impl RunningActionsManagerImpl {
             max_action_timeout: args.max_action_timeout,
             max_upload_timeout: args.max_upload_timeout,
             timeout_handled_externally: args.timeout_handled_externally,
+            batched_existence_check: args.batched_existence_check,
             running_actions: Mutex::new(HashMap::new()),
             action_done_tx,
             callbacks,

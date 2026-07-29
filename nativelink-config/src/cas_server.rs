@@ -872,6 +872,22 @@ pub struct UploadActionResultConfig {
     pub failure_message_template: String,
 }
 
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
+pub struct BatchedExistenceCheckConfig {
+    /// Maximum number of digests per batched existence-check request.
+    /// Requests are dispatched immediately (the in-flight request is the
+    /// accumulation window), so this only bounds request size.
+    /// Default: 1000
+    #[serde(default = "default_max_digests_per_batch")]
+    pub max_digests_per_batch: usize,
+}
+
+const fn default_max_digests_per_batch() -> usize {
+    1000
+}
+
 #[derive(Deserialize, Serialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
@@ -1005,6 +1021,23 @@ pub struct LocalWorkerConfig {
     /// them from CAS for every action.
     /// Default: None (directory cache disabled)
     pub directory_cache: Option<DirectoryCacheConfig>,
+
+    /// Coalesce the existence checks that the worker performs before
+    /// uploading action-output blobs into batched `FindMissingBlobs`
+    /// requests instead of one single-digest request per unique output
+    /// blob. Blobs that already exist in the CAS are never re-uploaded in
+    /// either mode (existence is always checked first and deduplicated by
+    /// digest, never by output path); this setting only reduces the number
+    /// of existence-check requests, which matters for actions with many
+    /// output files such as bundles that embed shared frameworks.
+    ///
+    /// Note: existence checks race with CAS eviction by design (the same
+    /// contract clients rely on for `FindMissingBlobs`); an aggressively
+    /// evicting CAS can invalidate any existence answer regardless of this
+    /// setting.
+    ///
+    /// Default: None (one existence-check request per unique output blob)
+    pub experimental_batched_output_existence_check: Option<BatchedExistenceCheckConfig>,
 
     /// Whether to use namespaces to isolate the execution. This is only available
     /// on Linux. It is highly recommended as it avoids a number of issues with

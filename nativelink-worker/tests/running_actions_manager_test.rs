@@ -16,6 +16,7 @@ use serial_test::serial;
 
 #[serial]
 mod tests {
+    use core::pin::Pin;
     use core::str::from_utf8;
     use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
     #[cfg(target_family = "unix")]
@@ -34,7 +35,8 @@ mod tests {
     use bytes::Bytes;
     use futures::prelude::*;
     use nativelink_config::cas_server::{
-        EnvironmentSource, UploadActionResultConfig, UploadCacheResultsStrategy,
+        BatchedExistenceCheckConfig, EnvironmentSource, UploadActionResultConfig,
+        UploadCacheResultsStrategy,
     };
     use nativelink_config::stores::{
         FastSlowSpec, FilesystemSpec, MemorySpec, StoreDirection, StoreSpec,
@@ -67,7 +69,8 @@ mod tests {
     };
     use nativelink_util::common::{DigestInfo, fs, make_temp_path};
     use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
-    use nativelink_util::store_trait::{Store, StoreLike};
+    use nativelink_util::health_utils::HealthStatusIndicator;
+    use nativelink_util::store_trait::{Store, StoreDriver, StoreLike};
     #[cfg(target_os = "linux")]
     use nativelink_worker::namespace_utils;
     use nativelink_worker::running_actions_manager::{
@@ -587,6 +590,7 @@ mod tests {
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -714,6 +718,7 @@ mod tests {
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -843,6 +848,7 @@ mod tests {
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -1027,6 +1033,7 @@ mod tests {
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -1213,6 +1220,7 @@ mod tests {
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -1468,6 +1476,7 @@ mod tests {
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -1621,6 +1630,7 @@ mod tests {
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -1765,6 +1775,7 @@ mod tests {
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -1904,6 +1915,7 @@ mod tests {
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -2111,6 +2123,7 @@ exit 0
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -2291,6 +2304,7 @@ exit 0
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -2465,6 +2479,7 @@ exit 1
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -2556,6 +2571,7 @@ exit 1
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -2634,6 +2650,7 @@ exit 1
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -2719,6 +2736,7 @@ exit 1
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -2825,6 +2843,7 @@ exit 1
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -2875,6 +2894,7 @@ exit 1
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -2946,6 +2966,7 @@ exit 1
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -3068,6 +3089,7 @@ exit 1
                     max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                     timeout_handled_externally: false,
                     directory_cache: None,
+                    batched_existence_check: None,
                     #[cfg(target_os = "linux")]
                     use_namespaces: use_namespaces(),
                 },
@@ -3159,6 +3181,7 @@ exit 1
                     max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                     timeout_handled_externally: false,
                     directory_cache: None,
+                    batched_existence_check: None,
                     #[cfg(target_os = "linux")]
                     use_namespaces: use_namespaces(),
                 },
@@ -3250,6 +3273,7 @@ exit 1
                     max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                     timeout_handled_externally: false,
                     directory_cache: None,
+                    batched_existence_check: None,
                     #[cfg(target_os = "linux")]
                     use_namespaces: use_namespaces(),
                 },
@@ -3338,6 +3362,7 @@ exit 1
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -3490,6 +3515,7 @@ exit 1
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -3659,6 +3685,7 @@ exit 1
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -3772,6 +3799,7 @@ exit 1
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 // Pin namespaces off so this exercises the no-pre_exec/posix_spawn
                 // path regardless of what the host kernel supports.
                 use_namespaces: nativelink_worker::running_actions_manager::UseNamespaces::No,
@@ -3886,6 +3914,7 @@ exit 1
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -4095,6 +4124,7 @@ exit 1
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -4194,6 +4224,7 @@ done
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -4378,6 +4409,7 @@ done
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -4502,6 +4534,7 @@ done
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -4647,6 +4680,7 @@ done
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -4759,6 +4793,7 @@ done
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             })?);
@@ -4902,6 +4937,7 @@ done
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -5076,6 +5112,7 @@ done
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                batched_existence_check: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
             },
@@ -5146,5 +5183,266 @@ done
         assert_eq!(parse_pgid_from_stat("no parenthesis here"), None);
         assert_eq!(parse_pgid_from_stat("123 (only) S"), None); // too few fields
         assert_eq!(parse_pgid_from_stat(""), None);
+    }
+
+    #[derive(Debug, nativelink_metric::MetricsComponent)]
+    struct ExistenceCountingStore {
+        #[metric(group = "inner")]
+        inner: Store,
+        has_calls: AtomicU64,
+        has_digests: AtomicU64,
+        updated_keys: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl nativelink_util::store_trait::StoreDriver for ExistenceCountingStore {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn has_with_results(
+            self: Pin<&Self>,
+            keys: &[nativelink_util::store_trait::StoreKey<'_>],
+            results: &mut [Option<u64>],
+        ) -> Result<(), Error> {
+            self.has_calls.fetch_add(1, Ordering::Relaxed);
+            self.has_digests
+                .fetch_add(keys.len() as u64, Ordering::Relaxed);
+            self.inner
+                .as_store_driver_pin()
+                .has_with_results(keys, results)
+                .await
+        }
+        async fn update(
+            self: Pin<&Self>,
+            key: nativelink_util::store_trait::StoreKey<'_>,
+            reader: nativelink_util::buf_channel::DropCloserReadHalf,
+            size_info: nativelink_util::store_trait::UploadSizeInfo,
+        ) -> Result<u64, Error> {
+            self.updated_keys
+                .lock()
+                .unwrap()
+                .push(key.as_str().to_string());
+            self.inner
+                .as_store_driver_pin()
+                .update(key, reader, size_info)
+                .await
+        }
+        async fn get_part(
+            self: Pin<&Self>,
+            key: nativelink_util::store_trait::StoreKey<'_>,
+            writer: &mut nativelink_util::buf_channel::DropCloserWriteHalf,
+            offset: u64,
+            length: Option<u64>,
+        ) -> Result<(), Error> {
+            self.inner
+                .as_store_driver_pin()
+                .get_part(key, writer, offset, length)
+                .await
+        }
+        fn inner_store(
+            &self,
+            _key: Option<nativelink_util::store_trait::StoreKey>,
+        ) -> &dyn nativelink_util::store_trait::StoreDriver {
+            self
+        }
+        fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
+            self
+        }
+        fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+            self
+        }
+        fn register_remove_callback(
+            self: Arc<Self>,
+            callback: Arc<dyn nativelink_util::store_trait::RemoveItemCallback>,
+        ) -> Result<(), Error> {
+            self.inner.clone().register_remove_callback(callback)
+        }
+    }
+
+    nativelink_util::health_utils::default_health_status_indicator!(ExistenceCountingStore);
+
+    // Output blobs whose digests already exist in the CAS must not be
+    // re-uploaded (deduplicated by digest, never by path), duplicate digests
+    // within one action must upload once, and with the batched existence
+    // check enabled the checks must flow through has_with_results batches.
+    #[nativelink_test]
+    async fn batched_existence_check_skips_present_output_blobs()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const WORKER_ID: &str = "foo_worker_id";
+
+        fn test_monotonic_clock() -> SystemTime {
+            static CLOCK: AtomicU64 = AtomicU64::new(0);
+            monotonic_clock(&CLOCK)
+        }
+
+        let fast_config = FilesystemSpec {
+            content_path: make_temp_path("counting_content_path"),
+            temp_path: make_temp_path("counting_temp_path"),
+            eviction_policy: None,
+            ..Default::default()
+        };
+        let fast_store: Arc<FilesystemStore> = FilesystemStore::new(&fast_config).await?;
+        let counting_store = Arc::new(ExistenceCountingStore {
+            inner: Store::new(MemoryStore::new(&MemorySpec::default())),
+            has_calls: AtomicU64::new(0),
+            has_digests: AtomicU64::new(0),
+            updated_keys: Mutex::new(Vec::new()),
+        });
+        let cas_store = FastSlowStore::new(
+            &FastSlowSpec {
+                fast: StoreSpec::Filesystem(fast_config),
+                slow: StoreSpec::Memory(MemorySpec::default()),
+                fast_direction: StoreDirection::default(),
+                slow_direction: StoreDirection::default(),
+                bypass_dedup_threshold_bytes: 0,
+            },
+            Store::new(fast_store),
+            Store::new(counting_store.clone()),
+        );
+
+        // Pre-seed the "shared framework" blob into the slow CAS under a
+        // DIFFERENT path than the action will output it at.
+        const PRESENT_CONTENT: &str = "shared framework bytes";
+        fn digest_of(data: &[u8]) -> DigestInfo {
+            let mut hasher = DigestHasherFunc::Sha256.hasher();
+            nativelink_util::digest_hasher::DigestHasher::update(&mut hasher, data);
+            nativelink_util::digest_hasher::DigestHasher::finalize_digest(&mut hasher)
+        }
+        let present_digest = digest_of(PRESENT_CONTENT.as_bytes());
+        cas_store
+            .as_pin()
+            .update_oneshot(present_digest.into(), PRESENT_CONTENT.into())
+            .await?;
+        let updates_after_seed = counting_store.updated_keys.lock().unwrap().len();
+
+        let root_action_directory = make_temp_path("counting_root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+        let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+            RunningActionsManagerArgs {
+                root_action_directory,
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store.clone(),
+                ac_store: None,
+                historical_store: Store::new(cas_store.clone()),
+                upload_action_result_config: &UploadActionResultConfig {
+                    upload_ac_results_strategy: UploadCacheResultsStrategy::Never,
+                    ..Default::default()
+                },
+                max_action_timeout: Duration::MAX,
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
+                max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
+                timeout_handled_externally: false,
+                directory_cache: None,
+                batched_existence_check: Some(BatchedExistenceCheckConfig {
+                    max_digests_per_batch: 100,
+                }),
+                #[cfg(target_os = "linux")]
+                use_namespaces: use_namespaces(),
+            },
+            Callbacks {
+                now_fn: test_monotonic_clock,
+                sleep_fn: |_duration| Box::pin(future::pending()),
+            },
+        )?);
+
+        let command = Command {
+            arguments: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "printf 'unique payload' > unique.bin; \
+                     printf 'unique payload' > duplicate.bin; \
+                     printf '{PRESENT_CONTENT}' > embedded_framework.bin"
+                ),
+            ],
+            output_files: vec![
+                "unique.bin".to_string(),
+                "duplicate.bin".to_string(),
+                "embedded_framework.bin".to_string(),
+            ],
+            environment_variables: vec![EnvironmentVariable {
+                name: "PATH".to_string(),
+                value: env::var("PATH").unwrap(),
+            }],
+            ..Default::default()
+        };
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let input_root_digest = serialize_and_upload_message(
+            &Directory::default(),
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+
+        let has_digests_before = counting_store.has_digests.load(Ordering::Relaxed);
+        let running_action = running_actions_manager
+            .create_and_add_action(
+                WORKER_ID.to_string(),
+                StartExecute {
+                    execute_request: Some(ExecuteRequest {
+                        action_digest: Some(action_digest.into()),
+                        digest_function: ProtoDigestFunction::Sha256.into(),
+                        ..Default::default()
+                    }),
+                    operation_id: OperationId::default().to_string(),
+                    queued_timestamp: None,
+                    platform: action.platform.clone(),
+                    worker_id: WORKER_ID.to_string(),
+                },
+            )
+            .await?;
+        let result = running_action
+            .clone()
+            .prepare_action()
+            .and_then(RunningAction::execute)
+            .and_then(RunningAction::upload_results)
+            .and_then(RunningAction::get_finished_result)
+            .await?;
+        running_action.cleanup().await?;
+        assert_eq!(result.exit_code, 0, "Action failed: {result:?}");
+
+        let unique_digest = digest_of(b"unique payload");
+        let updated: Vec<String> =
+            counting_store.updated_keys.lock().unwrap()[updates_after_seed..].to_vec();
+        let present_key = nativelink_util::store_trait::StoreKey::from(present_digest)
+            .as_str()
+            .to_string();
+        let unique_key = nativelink_util::store_trait::StoreKey::from(unique_digest)
+            .as_str()
+            .to_string();
+        assert!(
+            !updated.contains(&present_key),
+            "Pre-existing blob was re-uploaded: {updated:?}"
+        );
+        assert_eq!(
+            updated.iter().filter(|k| **k == unique_key).count(),
+            1,
+            "Duplicate-digest outputs must upload exactly once: {updated:?}"
+        );
+        // All three outputs collapse to two unique digests; both must have
+        // been existence-checked through the batcher.
+        let checked = counting_store.has_digests.load(Ordering::Relaxed) - has_digests_before;
+        assert!(
+            checked >= 2,
+            "Expected at least 2 batched existence checks, got {checked}"
+        );
+        Ok(())
     }
 }

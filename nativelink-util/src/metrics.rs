@@ -690,3 +690,76 @@ pub fn execution_output_bytes(action_result: &ActionResult) -> u64 {
         + action_result.stdout_digest.size_bytes()
         + action_result.stderr_digest.size_bytes()
 }
+
+/// OpenTelemetry metrics for the worker's action-output upload path.
+pub static OUTPUT_UPLOAD_METRICS: LazyLock<OutputUploadMetrics> = LazyLock::new(|| {
+    let meter = global::meter_with_scope(InstrumentationScope::builder("nativelink").build());
+
+    OutputUploadMetrics {
+        find_missing_duration: meter
+            .f64_histogram("output_upload.find_missing.duration")
+            .with_description(
+                "Duration of batched existence checks issued before uploading action outputs in seconds",
+            )
+            .with_unit("s")
+            .with_boundaries(vec![
+                0.001, // 1ms
+                0.01,  // 10ms
+                0.05,  // 50ms
+                0.1,   // 100ms
+                0.25,  // 250ms
+                0.5,   // 500ms
+                1.0,   // 1s
+                2.0,   // 2s
+                5.0,   // 5s
+            ])
+            .build(),
+
+        digests_checked: meter
+            .u64_counter("output_upload.digests.checked")
+            .with_description("Number of output digests existence-checked before upload")
+            .with_unit("{digest}")
+            .build(),
+
+        bytes_total: meter
+            .u64_counter("output_upload.bytes.total")
+            .with_description("Total logical bytes of action-output blobs considered for upload")
+            .with_unit("By")
+            .build(),
+
+        bytes_sent: meter
+            .u64_counter("output_upload.bytes.sent")
+            .with_description("Bytes of action-output blobs actually uploaded")
+            .with_unit("By")
+            .build(),
+
+        bytes_skipped_existing: meter
+            .u64_counter("output_upload.bytes.skipped_existing")
+            .with_description("Bytes of action-output blobs skipped because the digest already existed")
+            .with_unit("By")
+            .build(),
+
+        blobs_skipped_existing: meter
+            .u64_counter("output_upload.blobs.skipped_existing")
+            .with_description("Number of action-output blobs skipped because the digest already existed")
+            .with_unit("{blob}")
+            .build(),
+    }
+});
+
+/// OpenTelemetry metrics instruments for the worker output-upload path.
+#[derive(Debug)]
+pub struct OutputUploadMetrics {
+    /// Histogram of batched existence-check durations in seconds
+    pub find_missing_duration: metrics::Histogram<f64>,
+    /// Counter of output digests existence-checked
+    pub digests_checked: metrics::Counter<u64>,
+    /// Counter of logical output bytes considered for upload
+    pub bytes_total: metrics::Counter<u64>,
+    /// Counter of output bytes actually uploaded
+    pub bytes_sent: metrics::Counter<u64>,
+    /// Counter of output bytes skipped as already existing
+    pub bytes_skipped_existing: metrics::Counter<u64>,
+    /// Counter of output blobs skipped as already existing
+    pub blobs_skipped_existing: metrics::Counter<u64>,
+}
